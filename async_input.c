@@ -104,6 +104,7 @@
 #define SYNTHETIC_AUTO_NEXT_DOWN_GAP_NS 100000ULL
 #define SYNTHETIC_TEST_UP_DELAY_NS 4000000ULL
 #define SYNTHETIC_TEST_MULTI_TAP_GAP_NS 12000000ULL
+#define TEST_MACRO_POST_AHEAD_NS 16000000ULL
 #define TEST_MACRO_HOLD_NONE 0
 #define TEST_MACRO_HOLD_RELEASE_UP 1
 #define TEST_MACRO_HOLD_END_TAP 2
@@ -371,6 +372,7 @@ static volatile int g_test_macro_enabled = 0;
 static volatile int g_hooks_installed = 0;
 static volatile int g_in_async_replay = 0;
 static volatile int g_current_replay_is_synthetic_auto = 0;
+static volatile int g_current_replay_is_synthetic_test = 0;
 static volatile int g_in_auto_state_machine_replay = 0;
 static volatile int g_in_conductor_frame __attribute__((unused)) = 0;
 static volatile int g_in_playercontrol_original = 0;
@@ -604,6 +606,7 @@ static int g_last_test_macro_taps_so_far = -1;
 static int g_last_test_macro_taps_on_floor = -1;
 static int g_test_macro_hold_active = 0;
 static int g_test_macro_hold_seq = -1;
+static int g_test_macro_hold_source_id = SYNTHETIC_TEST_SOURCE_ID;
 static uint64_t g_test_macro_hold_release_tick = 0;
 static int g_test_macro_hold_release_mode = 0;
 static IngressRecord g_ingress_queue[MAX_INGRESS_RECORDS];
@@ -975,6 +978,7 @@ static void reset_test_macro_target_state_locked(void) {
     g_last_test_macro_taps_on_floor = -1;
     g_test_macro_hold_active = 0;
     g_test_macro_hold_seq = -1;
+    g_test_macro_hold_source_id = SYNTHETIC_TEST_SOURCE_ID;
     g_test_macro_hold_release_tick = 0;
     g_test_macro_hold_release_mode = TEST_MACRO_HOLD_NONE;
 }
@@ -2129,7 +2133,13 @@ static int prepare_replay_step(uint64_t target_tick, uint64_t *step_limit) {
     return 1;
 }
 
-static int pop_events_for_tick(uint64_t max_tick, uint64_t *tick, int *down_count, int *up_count, int *held_count, int *synthetic_auto_count) {
+static int pop_events_for_tick(uint64_t max_tick,
+                               uint64_t *tick,
+                               int *down_count,
+                               int *up_count,
+                               int *held_count,
+                               int *synthetic_auto_count,
+                               int *synthetic_test_count) {
     pthread_mutex_lock(&g_lock);
     if (queue_active_count_locked() <= 0) {
         g_queue_head = 0;
@@ -2171,6 +2181,7 @@ static int pop_events_for_tick(uint64_t max_tick, uint64_t *tick, int *down_coun
     int down = 0;
     int up = 0;
     int synthetic_auto = 0;
+    int synthetic_test = 0;
     uint64_t down_slot_mask = 0;
     uint64_t up_slot_mask = 0;
     int consume = g_queue_head;
@@ -2187,6 +2198,9 @@ static int pop_events_for_tick(uint64_t max_tick, uint64_t *tick, int *down_coun
         int source_id = g_queue[consume].source_id;
         if (g_queue[consume].synthetic_auto) {
             synthetic_auto++;
+        }
+        if (g_queue[consume].synthetic_test) {
+            synthetic_test++;
         }
         int logical_index = logical_source_index_locked(source_id);
         if (g_queue[consume].type == EVENT_DOWN) {
@@ -2233,6 +2247,9 @@ static int pop_events_for_tick(uint64_t max_tick, uint64_t *tick, int *down_coun
     }
     if (synthetic_auto_count != NULL) {
         *synthetic_auto_count = synthetic_auto;
+    }
+    if (synthetic_test_count != NULL) {
+        *synthetic_test_count = synthetic_test;
     }
     pthread_mutex_unlock(&g_lock);
     return 1;
@@ -3374,16 +3391,76 @@ static void trace_judgement_state(const char *stage, void *player_self, int is_a
     int up = __atomic_load_n(&g_current_replay_up, __ATOMIC_ACQUIRE);
     int held = __atomic_load_n(&g_current_replay_held, __ATOMIC_ACQUIRE);
     int synthetic_auto = __atomic_load_n(&g_current_replay_is_synthetic_auto, __ATOMIC_ACQUIRE);
+    int synthetic_test = __atomic_load_n(&g_current_replay_is_synthetic_test, __ATOMIC_ACQUIRE);
     int controller_state = controller_current_state(g_current_controller_self);
+    const char *stage_name = stage ? stage : "?";
+    typedef struct TraceDedupEntry {
+        int used;
+        char stage[48];
+        int floor_seq;
+        int next_seq;
+        int key_times;
+        int hold_keys;
+        int result;
+        int down;
+        int up;
+        int held;
+        double angle;
+        double cached_angle;
+    } TraceDedupEntry;
+    static uint64_t last_trace_id = 0;
+    static TraceDedupEntry entries[16];
+    if (last_trace_id != trace_id) {
+        memset(entries, 0, sizeof(entries));
+        last_trace_id = trace_id;
+    }
+    TraceDedupEntry *entry = NULL;
+    for (int i = 0; i < 16; ++i) {
+        if (entries[i].used && strcmp(entries[i].stage, stage_name) == 0) {
+            entry = &entries[i];
+            break;
+        }
+        if (entry == NULL && !entries[i].used) {
+            entry = &entries[i];
+        }
+    }
+    if (entry != NULL && entry->used &&
+        entry->floor_seq == state.floor_seq &&
+        entry->next_seq == state.next_seq &&
+        entry->key_times == state.key_times_count &&
+        entry->hold_keys == state.hold_keys_count &&
+        entry->result == result_value &&
+        entry->down == down &&
+        entry->up == up &&
+        entry->held == held &&
+        fabs(entry->angle - state.angle) < 0.000000001 &&
+        fabs(entry->cached_angle - state.cached_angle) < 0.000000001) {
+        return;
+    }
+    if (entry != NULL) {
+        entry->used = 1;
+        snprintf(entry->stage, sizeof(entry->stage), "%s", stage_name);
+        entry->floor_seq = state.floor_seq;
+        entry->next_seq = state.next_seq;
+        entry->key_times = state.key_times_count;
+        entry->hold_keys = state.hold_keys_count;
+        entry->result = result_value;
+        entry->down = down;
+        entry->up = up;
+        entry->held = held;
+        entry->angle = state.angle;
+        entry->cached_angle = state.cached_angle;
+    }
+
     LOGI("TRACE state stage=%s id=%" PRIu64
          " tick=%" PRIu64
-         " down=%d up=%d held=%d isAuto=%d syntheticAuto=%d result=%d"
+         " down=%d up=%d held=%d isAuto=%d syntheticAuto=%d syntheticTest=%d result=%d"
          " ctrlState=%d floor=%d next=%d taps=%d/%d holdLength=%d holdCompletion=%.6f"
          " keyTimes=%d holdKeys=%d keyTotal=%d limiter=%d consecMulti=%d tapsOnFloor=%d"
          " alive=%d responsive=%d lastHit=%.9f actualLastHit=%.9f"
          " angle=%.9f cached=%.9f snapped=%.9f target=%.9f speed=%.6f isCW=%d"
          " entryTime=%.9f entryTimePitchAdj=%.9f",
-         stage ? stage : "?",
+         stage_name,
          trace_id,
          tick,
          down,
@@ -3391,6 +3468,7 @@ static void trace_judgement_state(const char *stage, void *player_self, int is_a
          held,
          is_auto,
          synthetic_auto,
+         synthetic_test,
          result_value,
          controller_state,
          state.floor_seq,
@@ -3660,6 +3738,8 @@ static int hooked_get_hit_margin(float hitangle,
         int down = __atomic_load_n(&g_current_replay_down, __ATOMIC_ACQUIRE);
         int up = __atomic_load_n(&g_current_replay_up, __ATOMIC_ACQUIRE);
         int held = __atomic_load_n(&g_current_replay_held, __ATOMIC_ACQUIRE);
+        int synthetic_auto = __atomic_load_n(&g_current_replay_is_synthetic_auto, __ATOMIC_ACQUIRE);
+        int synthetic_test = __atomic_load_n(&g_current_replay_is_synthetic_test, __ATOMIC_ACQUIRE);
         if (trace_id != 0 && down > 0) {
             double angle_delta_deg =
                 (double)((hitangle - refangle) * (float)(is_cw ? 1 : -1) * 57.29578f);
@@ -3697,7 +3777,7 @@ static int hooked_get_hit_margin(float hitangle,
                 margin_scale);
             LOGI("TRACE official id=%" PRIu64
                  " tick=%" PRIu64
-                 " mode=%d down=%d up=%d held=%d margin=%s(%d) offset_ms=%.3f angle_delta_deg=%.3f"
+                 " mode=%d down=%d up=%d held=%d syntheticAuto=%d syntheticTest=%d margin=%s(%d) offset_ms=%.3f angle_delta_deg=%.3f"
                  " modelMargin=%s(%d) modelOffset_ms=%.3f modelAngleDelta_deg=%.3f"
                  " hit=%.9f target=%.9f isCW=%d bpmTimesSpeed=%.6f pitch=%.6f marginScale=%.6f",
                  trace_id,
@@ -3706,6 +3786,8 @@ static int hooked_get_hit_margin(float hitangle,
                  down,
                  up,
                  held,
+                 synthetic_auto,
+                 synthetic_test,
                  shadow_margin_name((AdoOfficialHitMargin)result),
                  result,
                  offset_ms,
@@ -3894,7 +3976,7 @@ static int __attribute__((unused)) capture_accepts_raw_ns(uint64_t raw_ns) {
     return raw_ns > g_capture_floor_raw_ns;
 }
 
-static void call_process_key_inputs(void *controller_self, uint64_t tick, int replay_mode, int synthetic_auto) {
+static void call_process_key_inputs(void *controller_self, uint64_t tick, int replay_mode, int synthetic_auto, int synthetic_test) {
     if (controller_self == NULL || !ensure_process_key_inputs_ready()) {
         return;
     }
@@ -3907,6 +3989,7 @@ static void call_process_key_inputs(void *controller_self, uint64_t tick, int re
     int prev_replay_up = __atomic_load_n(&g_current_replay_up, __ATOMIC_ACQUIRE);
     int prev_replay_held = __atomic_load_n(&g_current_replay_held, __ATOMIC_ACQUIRE);
     int prev_synthetic_auto = __atomic_load_n(&g_current_replay_is_synthetic_auto, __ATOMIC_ACQUIRE);
+    int prev_synthetic_test = __atomic_load_n(&g_current_replay_is_synthetic_test, __ATOMIC_ACQUIRE);
 
     uint64_t reported_tick = tick ? tick : replay_target_tick_now();
     uint64_t trace_id = 0;
@@ -3916,12 +3999,12 @@ static void call_process_key_inputs(void *controller_self, uint64_t tick, int re
     if (tick != 0) {
         trace_id = __atomic_add_fetch(&g_replay_event_count, 1, __ATOMIC_RELAXED);
         if (g_trace_enabled && (trace_id <= 8 || (trace_id % 64ULL) == 0)) {
-            LOGI("TRACE replay id=%" PRIu64 " tick=%" PRIu64 " mode=%d down=%d up=%d held=%d syntheticAuto=%d",
-                 trace_id, tick, replay_mode, trace_down, trace_up, trace_held, synthetic_auto ? 1 : 0);
+            LOGI("TRACE replay id=%" PRIu64 " tick=%" PRIu64 " mode=%d down=%d up=%d held=%d syntheticAuto=%d syntheticTest=%d",
+                 trace_id, tick, replay_mode, trace_down, trace_up, trace_held, synthetic_auto ? 1 : 0, synthetic_test ? 1 : 0);
         }
         if (g_trace_enabled) {
-            LOGI("TRACE call id=%" PRIu64 " tick=%" PRIu64 " mode=%d down=%d up=%d held=%d syntheticAuto=%d",
-                 trace_id, tick, replay_mode, trace_down, trace_up, trace_held, synthetic_auto ? 1 : 0);
+            LOGI("TRACE call id=%" PRIu64 " tick=%" PRIu64 " mode=%d down=%d up=%d held=%d syntheticAuto=%d syntheticTest=%d",
+                 trace_id, tick, replay_mode, trace_down, trace_up, trace_held, synthetic_auto ? 1 : 0, synthetic_test ? 1 : 0);
         }
     }
     ProcessKeyInputsFn fn = (ProcessKeyInputsFn)g_process_key_inputs_method.method_pointer;
@@ -3931,6 +4014,7 @@ static void call_process_key_inputs(void *controller_self, uint64_t tick, int re
     __atomic_store_n(&g_current_replay_up, trace_up, __ATOMIC_RELEASE);
     __atomic_store_n(&g_current_replay_held, trace_held, __ATOMIC_RELEASE);
     __atomic_store_n(&g_current_replay_is_synthetic_auto, synthetic_auto ? 1 : 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_current_replay_is_synthetic_test, synthetic_test ? 1 : 0, __ATOMIC_RELEASE);
     g_in_async_replay = 1;
     g_replay_mode = replay_mode;
     if (g_trace_enabled) {
@@ -3945,6 +4029,7 @@ static void call_process_key_inputs(void *controller_self, uint64_t tick, int re
     __atomic_store_n(&g_current_replay_up, prev_replay_up, __ATOMIC_RELEASE);
     __atomic_store_n(&g_current_replay_held, prev_replay_held, __ATOMIC_RELEASE);
     __atomic_store_n(&g_current_replay_is_synthetic_auto, prev_synthetic_auto, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_current_replay_is_synthetic_test, prev_synthetic_test, __ATOMIC_RELEASE);
     sync_last_reported_target_tick(reported_tick);
 }
 
@@ -4171,7 +4256,7 @@ static int consume_auto_hit_via_async_state_machine(void *player_self) {
 
     apply_primary_key_masks(1, 0, 1);
     __atomic_store_n(&g_in_auto_state_machine_replay, 1, __ATOMIC_RELEASE);
-    call_process_key_inputs(controller_self, tick, REPLAY_MODE_MASK, 1);
+    call_process_key_inputs(controller_self, tick, REPLAY_MODE_MASK, 1, 0);
     __atomic_store_n(&g_in_auto_state_machine_replay, 0, __ATOMIC_RELEASE);
     restore_async_angle_to_tick(controller_self, frame_tick);
     write_rdc_auto(old_rdc_auto);
@@ -4202,6 +4287,13 @@ static int consume_auto_hit_via_async_state_machine(void *player_self) {
              count);
     }
     return 1;
+}
+
+static uint64_t test_macro_tap_down_raw(uint64_t raw_down, int index, int simultaneous_taps) {
+    if (index < simultaneous_taps) {
+        return raw_down;
+    }
+    return raw_down + (uint64_t)(index - simultaneous_taps + 1) * SYNTHETIC_TEST_MULTI_TAP_GAP_NS;
 }
 
 static int post_test_macro_input_for_controller(void *controller_self) {
@@ -4261,12 +4353,14 @@ static int post_test_macro_input_for_controller(void *controller_self) {
     if (g_test_macro_hold_active) {
         uint64_t release_tick = g_test_macro_hold_release_tick;
         int release_mode = g_test_macro_hold_release_mode;
+        int hold_source_id = g_test_macro_hold_source_id;
         if (release_tick == 0 || g_test_macro_hold_seq != curr_seq) {
             if (release_mode == TEST_MACRO_HOLD_RELEASE_UP) {
-                (void)ingress_post_event(EVENT_UP, SYNTHETIC_TEST_SOURCE_ID, monotonic_ns_now());
+                (void)ingress_post_event(EVENT_UP, hold_source_id, monotonic_ns_now());
             }
             g_test_macro_hold_active = 0;
             g_test_macro_hold_seq = -1;
+            g_test_macro_hold_source_id = SYNTHETIC_TEST_SOURCE_ID;
             g_test_macro_hold_release_tick = 0;
             g_test_macro_hold_release_mode = TEST_MACRO_HOLD_NONE;
             return 0;
@@ -4277,10 +4371,10 @@ static int post_test_macro_input_for_controller(void *controller_self) {
         int posted = 0;
         if (release_mode == TEST_MACRO_HOLD_END_TAP) {
             posted =
-                ingress_post_event(EVENT_DOWN, SYNTHETIC_TEST_SOURCE_ID, raw_release) &&
-                ingress_post_event(EVENT_UP, SYNTHETIC_TEST_SOURCE_ID, raw_release + SYNTHETIC_TEST_UP_DELAY_NS);
+                ingress_post_event(EVENT_DOWN, hold_source_id, raw_release) &&
+                ingress_post_event(EVENT_UP, hold_source_id, raw_release + SYNTHETIC_TEST_UP_DELAY_NS);
         } else {
-            posted = ingress_post_event(EVENT_UP, SYNTHETIC_TEST_SOURCE_ID, raw_release);
+            posted = ingress_post_event(EVENT_UP, hold_source_id, raw_release);
         }
         if (!posted) {
             return 0;
@@ -4288,6 +4382,7 @@ static int post_test_macro_input_for_controller(void *controller_self) {
 
         g_test_macro_hold_active = 0;
         g_test_macro_hold_seq = -1;
+        g_test_macro_hold_source_id = SYNTHETIC_TEST_SOURCE_ID;
         g_test_macro_hold_release_tick = 0;
         g_test_macro_hold_release_mode = TEST_MACRO_HOLD_NONE;
 
@@ -4296,13 +4391,14 @@ static int post_test_macro_input_for_controller(void *controller_self) {
         if (g_trace_enabled || hold_count <= 8 || (hold_count % 64ULL) == 0) {
             LOGI("TEST macro hold end count=%" PRIu64
                  " eventTick=%" PRIu64
-                 " mode=%d curr=%d target=%d rawRelease=%" PRIu64
+                 " mode=%d curr=%d target=%d source=%d rawRelease=%" PRIu64
                  " rawNow=%" PRIu64,
                  hold_count,
                  release_tick,
                  release_mode,
                  curr_seq,
                  target_seq,
+                 hold_source_id,
                  raw_release,
                  raw_now);
         }
@@ -4312,7 +4408,7 @@ static int post_test_macro_input_for_controller(void *controller_self) {
     uint64_t frame_tick = current_async_frame_tick_or_now();
     ensure_async_clock_fields(frame_tick, 100);
     uint64_t event_tick = target_tick_for_player(player_self, frame_tick, 0, "TEST macro");
-    if (event_tick == 0 || event_tick <= frame_tick) {
+    if (event_tick == 0) {
         return 0;
     }
     if (test_macro_target_already_posted(has_target_key,
@@ -4326,7 +4422,7 @@ static int post_test_macro_input_for_controller(void *controller_self) {
 
     uint64_t raw_down = wall_tick_to_raw_ns(event_tick);
     uint64_t raw_now = monotonic_ns_now();
-    if (raw_down <= raw_now) {
+    if (raw_down > raw_now + TEST_MACRO_POST_AHEAD_NS) {
         return 0;
     }
     uint64_t raw_up = raw_down + SYNTHETIC_TEST_UP_DELAY_NS;
@@ -4359,6 +4455,18 @@ static int post_test_macro_input_for_controller(void *controller_self) {
         taps_remaining = ASYNC_KEY_SLOT_COUNT;
     }
     int tap_events = hit_once_multitap ? 1 : taps_remaining;
+    /*
+     * Do not convert short-angle multipress exceptions into same-tick taps.
+     * Official UpdateHoldKeys consumes all keyTimes in one ProcessKeyInputs call,
+     * so an extra same-tick DOWN immediately hits the next floor and appears
+     * about one short-tile interval early. The macro should instead wait for the
+     * next floor to become current and post that floor's own target tick.
+     */
+    int multipress_extra_count = 0;
+    int simultaneous_taps = 1;
+    if (simultaneous_taps > tap_events) {
+        simultaneous_taps = tap_events;
+    }
     if (target_hold_length > -1 && hold_end_entry_time > 0.0) {
         uint64_t offset_tick = 0;
         (void)read_static_u64_field(g_field_async_offset_tick, &offset_tick);
@@ -4366,7 +4474,7 @@ static int post_test_macro_input_for_controller(void *controller_self) {
         if (hold_song_tick != 0) {
             hold_release_tick = offset_tick + hold_song_tick;
             uint64_t final_hold_down_raw =
-                raw_down + (uint64_t)(tap_events - 1) * SYNTHETIC_TEST_MULTI_TAP_GAP_NS;
+                test_macro_tap_down_raw(raw_down, tap_events - 1, simultaneous_taps);
             uint64_t final_hold_down_tick = raw_ns_to_wall_tick(final_hold_down_raw);
             if (hold_release_tick <= final_hold_down_tick) {
                 hold_release_tick = 0;
@@ -4375,7 +4483,7 @@ static int post_test_macro_input_for_controller(void *controller_self) {
     }
     if (hold_release_tick != 0) {
         for (int i = 0; i < tap_events - 1; ++i) {
-            uint64_t tap_down = raw_down + (uint64_t)i * SYNTHETIC_TEST_MULTI_TAP_GAP_NS;
+            uint64_t tap_down = test_macro_tap_down_raw(raw_down, i, simultaneous_taps);
             uint64_t tap_up = tap_down + SYNTHETIC_TEST_UP_DELAY_NS;
             int source_id = SYNTHETIC_TEST_SOURCE_ID + i;
             if (!ingress_post_event(EVENT_DOWN, source_id, tap_down) ||
@@ -4384,23 +4492,25 @@ static int post_test_macro_input_for_controller(void *controller_self) {
             }
         }
 
-        uint64_t hold_down_raw = raw_down + (uint64_t)(tap_events - 1) * SYNTHETIC_TEST_MULTI_TAP_GAP_NS;
-        if (!ingress_post_event(EVENT_DOWN, SYNTHETIC_TEST_SOURCE_ID, hold_down_raw)) {
+        uint64_t hold_down_raw = test_macro_tap_down_raw(raw_down, tap_events - 1, simultaneous_taps);
+        int hold_source_id = SYNTHETIC_TEST_SOURCE_ID + (tap_events - 1);
+        if (!ingress_post_event(EVENT_DOWN, hold_source_id, hold_down_raw)) {
             return 0;
         }
         g_test_macro_hold_active = 1;
         g_test_macro_hold_seq = target_seq;
+        g_test_macro_hold_source_id = hold_source_id;
         g_test_macro_hold_release_tick = hold_release_tick;
         g_test_macro_hold_release_mode =
             (hold_behavior == 2) ? TEST_MACRO_HOLD_END_TAP : TEST_MACRO_HOLD_RELEASE_UP;
         if (g_test_macro_hold_release_mode == TEST_MACRO_HOLD_END_TAP) {
-            if (!ingress_post_event(EVENT_UP, SYNTHETIC_TEST_SOURCE_ID, hold_down_raw + SYNTHETIC_TEST_UP_DELAY_NS)) {
+            if (!ingress_post_event(EVENT_UP, hold_source_id, hold_down_raw + SYNTHETIC_TEST_UP_DELAY_NS)) {
                 return 0;
             }
         }
     } else {
         for (int i = 0; i < tap_events; ++i) {
-            uint64_t tap_down = raw_down + (uint64_t)i * SYNTHETIC_TEST_MULTI_TAP_GAP_NS;
+            uint64_t tap_down = test_macro_tap_down_raw(raw_down, i, simultaneous_taps);
             uint64_t tap_up = tap_down + SYNTHETIC_TEST_UP_DELAY_NS;
             int source_id = SYNTHETIC_TEST_SOURCE_ID + i;
             if (!ingress_post_event(EVENT_DOWN, source_id, tap_down) ||
@@ -4418,7 +4528,7 @@ static int post_test_macro_input_for_controller(void *controller_self) {
              " eventTick=%" PRIu64
              " frameTick=%" PRIu64
              " curr=%d target=%d taps=%d/%d"
-             " tapsNeeded=%d tapsPosted=%d multitapBehavior=%d holdBehavior=%d holdLength=%d holdMode=%d"
+             " tapsNeeded=%d tapsPosted=%d pseudoMulti=%d simultaneous=%d multitapBehavior=%d holdBehavior=%d holdLength=%d holdMode=%d"
              " rawDown=%" PRIu64
              " rawUp=%" PRIu64
              " rawNow=%" PRIu64,
@@ -4431,6 +4541,8 @@ static int post_test_macro_input_for_controller(void *controller_self) {
              taps_on_floor,
              target_taps_needed,
              tap_events,
+             multipress_extra_count,
+             simultaneous_taps,
              multitap_behavior,
              hold_behavior,
              target_hold_length,
@@ -4505,6 +4617,7 @@ static int replay_pending_events_via_process_key_inputs(void *controller_self, u
     int up = 0;
     int held = 0;
     int synthetic_auto = 0;
+    int synthetic_test = 0;
     int replayed = 0;
     int had_pending = 0;
     uint64_t now_raw_ns = monotonic_ns_now();
@@ -4512,7 +4625,7 @@ static int replay_pending_events_via_process_key_inputs(void *controller_self, u
     pthread_mutex_lock(&g_lock);
     had_pending = queue_active_count_locked() > 0;
     pthread_mutex_unlock(&g_lock);
-    while (replayed < MAX_EVENTS && pop_events_for_tick(now_raw_ns, &event_raw_ns, &down, &up, &held, &synthetic_auto)) {
+    while (replayed < MAX_EVENTS && pop_events_for_tick(now_raw_ns, &event_raw_ns, &down, &up, &held, &synthetic_auto, &synthetic_test)) {
         if (!controller_allows_async_replay(controller_self)) {
             if (!controller_allows_async_capture(controller_self)) {
                 stop_capture_and_clear_queue();
@@ -4528,12 +4641,12 @@ static int replay_pending_events_via_process_key_inputs(void *controller_self, u
         }
 
         uint64_t event_tick = raw_ns_to_wall_tick(event_raw_ns);
-        call_process_key_inputs(controller_self, event_tick, replay_mode, synthetic_auto > 0);
+        call_process_key_inputs(controller_self, event_tick, replay_mode, synthetic_auto > 0, synthetic_test > 0);
         clear_frame_edges();
         replayed++;
     }
     if (replay_mode == REPLAY_MODE_MASK && replayed == 0 && !had_pending) {
-        call_process_key_inputs(controller_self, 0, replay_mode, 0);
+        call_process_key_inputs(controller_self, 0, replay_mode, 0, 0);
     } else if (replay_mode == REPLAY_MODE_MASK && replayed > 0) {
         restore_async_angle_to_tick(controller_self, target_tick);
     }
@@ -4661,7 +4774,7 @@ static void hooked_update_input(void *self, void *method) {
             LOGW("mask API unavailable, using legacy replay fallback for this frame");
         }
         replay_pending_events_via_process_key_inputs(self, target_tick, REPLAY_MODE_LEGACY);
-        call_process_key_inputs(self, 0, REPLAY_MODE_LEGACY, 0);
+        call_process_key_inputs(self, 0, REPLAY_MODE_LEGACY, 0, 0);
         g_current_controller_self = NULL;
         return;
     }
@@ -4726,7 +4839,7 @@ static int __attribute__((unused)) replay_pending_events(void *player_self) {
     uint64_t step_limit = 0;
     while (steps < REPLAY_MAX_STEPS_PER_FRAME && prepare_replay_step(target_tick, &step_limit)) {
         steps++;
-        while (pop_events_for_tick(step_limit, &tick, &down, &up, NULL, NULL)) {
+        while (pop_events_for_tick(step_limit, &tick, &down, &up, NULL, NULL, NULL)) {
             (void)down;
             (void)up;
             if (!controller_allows_async_replay(g_current_controller_self)) {
