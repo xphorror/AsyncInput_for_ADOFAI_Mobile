@@ -31,7 +31,9 @@ public class ExtraMenuUnityPlayerActivity extends com.unity3d.player.UnityPlayer
         if (asyncInputLoaded) {
             try {
                 View view = getWindow().getDecorView();
-                nativeOnTouchEvent(event, view.getWidth(), view.getHeight());
+                if (nativeOnTouchEvent(event, view.getWidth(), view.getHeight())) {
+                    return true;
+                }
             } catch (Throwable t) {
                 Log.e(TAG, "nativeOnTouchEvent failed", t);
             }
@@ -43,7 +45,9 @@ public class ExtraMenuUnityPlayerActivity extends com.unity3d.player.UnityPlayer
     public boolean dispatchKeyEvent(KeyEvent event) {
         if (asyncInputLoaded) {
             try {
-                nativeOnKeyEvent(event);
+                if (nativeOnKeyEvent(event)) {
+                    return true;
+                }
             } catch (Throwable t) {
                 Log.e(TAG, "nativeOnKeyEvent failed", t);
             }

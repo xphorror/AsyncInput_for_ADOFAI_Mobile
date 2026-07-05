@@ -20,9 +20,7 @@
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
-#ifndef PACKAGE_NAME
 #define PACKAGE_NAME "com.fizzd.connectedworlds.leveleditor.debug"
-#endif
 #define CFG_PATH "/data/data/" PACKAGE_NAME "/files/adofai_async_input.cfg"
 #define AUTO_REPLAY_CFG_PATH "/data/data/" PACKAGE_NAME "/files/adofai_async_auto_replay.cfg"
 #define TRACE_CFG_PATH "/data/data/" PACKAGE_NAME "/files/adofai_async_trace.cfg"
@@ -538,8 +536,10 @@ static void close_async_capture(void);
 static void disable_async_for_dlc_if_needed(const char *reason);
 static void stop_capture_and_clear_queue(void);
 static int capture_accepts_raw_ns(uint64_t raw_ns);
+static void *read_adobase_controller(void);
 static int controller_current_state(void *controller_self);
 static int controller_cached_state(void *controller_self);
+static int controller_is_paused(void *controller_self);
 static int try_controller_destination_state(void *controller_self, int *out_state);
 static int controller_allows_async_capture(void *controller_self);
 static int controller_allows_async_replay(void *controller_self);
@@ -2595,6 +2595,20 @@ static int remove_suppressed_source(int source_id) {
     return removed;
 }
 
+static int has_suppressed_motion_sources(void) {
+    int has_sources = 0;
+    pthread_mutex_lock(&g_lock);
+    for (int i = 0; i < g_suppressed_count; ++i) {
+        int source = (g_suppressed_sources[i] >> 16) & 0xffff;
+        if (source == SOURCE_TOUCHSCREEN || source == SOURCE_MOUSE) {
+            has_sources = 1;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_lock);
+    return has_sources;
+}
+
 static int __attribute__((unused)) capture_start_suppresses_raw_ns(uint64_t raw_ns) {
     pthread_mutex_lock(&g_lock);
     uint64_t suppress_until = g_capture_suppress_until_raw_ns;
@@ -2629,6 +2643,17 @@ static void clear_ui_sources(void) {
     pthread_mutex_unlock(&g_lock);
 }
 
+static int close_capture_if_controller_paused_now(void) {
+    void *controller = read_adobase_controller();
+    if (controller != NULL && controller_is_paused(controller)) {
+        if (capture_gate_open()) {
+            close_async_capture();
+        }
+        return 1;
+    }
+    return 0;
+}
+
 JNIEXPORT jboolean JNICALL
 Java_com_fizzd_connectedworlds_editorport_ExtraMenuUnityPlayerActivity_nativeOnTouchEvent(JNIEnv *env, jclass clazz, jobject event, jint view_width, jint view_height) {
     (void)clazz;
@@ -2636,6 +2661,9 @@ Java_com_fizzd_connectedworlds_editorport_ExtraMenuUnityPlayerActivity_nativeOnT
         return JNI_FALSE;
     }
     ensure_input_thread_started();
+    if (close_capture_if_controller_paused_now()) {
+        return JNI_FALSE;
+    }
 
     MotionEventSnapshot native_event;
     int native_ok = native_motion_snapshot(env, event, &native_event);
@@ -2665,6 +2693,7 @@ Java_com_fizzd_connectedworlds_editorport_ExtraMenuUnityPlayerActivity_nativeOnT
         }
     }
     int source_id = (source << 16) ^ (pointer_id & 0xffff);
+    int was_suppressed = 0;
 
     if (action == ACTION_DOWN || action == ACTION_POINTER_DOWN) {
         float x = 0.0f;
@@ -2690,6 +2719,7 @@ Java_com_fizzd_connectedworlds_editorport_ExtraMenuUnityPlayerActivity_nativeOnT
             }
         }
     } else if (action == ACTION_CANCEL) {
+        int consume_cancel = has_suppressed_motion_sources();
         clear_ui_sources();
         pthread_mutex_lock(&g_lock);
         clear_runtime_state_locked();
@@ -2698,29 +2728,49 @@ Java_com_fizzd_connectedworlds_editorport_ExtraMenuUnityPlayerActivity_nativeOnT
         if (g_mask_api_ready) {
             async_masks_clear_all_if_ready();
         }
-        return JNI_TRUE;
+        return consume_cancel ? JNI_TRUE : JNI_FALSE;
     } else if (action == ACTION_UP || action == ACTION_POINTER_UP) {
-        if (remove_suppressed_source(source_id)) {
-            return JNI_TRUE;
-        }
+        was_suppressed = remove_suppressed_source(source_id);
         if (remove_ui_source(source_id)) {
             return JNI_FALSE;
         }
+    } else if (action == ACTION_MOVE && has_suppressed_motion_sources()) {
+        if (capture_gate_open()) {
+            return JNI_TRUE;
+        }
+        pthread_mutex_lock(&g_lock);
+        clear_runtime_state_locked();
+        pthread_mutex_unlock(&g_lock);
+        g_managed_masks_need_clear = 1;
+        if (g_mask_api_ready) {
+            async_masks_clear_all_if_ready();
+        }
+        return JNI_TRUE;
     }
 
     if (!capture_gate_open()) {
         log_touch_gate_limited("capture_closed", action, source_id, raw_ns);
         restore_regular_input_types();
-        return JNI_FALSE;
+        return was_suppressed ? JNI_TRUE : JNI_FALSE;
     }
 
     if (!native_ok) {
         raw_ns = java_event_time_ns(env, event);
     }
+    if (!capture_accepts_raw_ns(raw_ns)) {
+        return JNI_FALSE;
+    }
     if (action == ACTION_DOWN || action == ACTION_POINTER_DOWN) {
         log_touch_gate_limited("post_down", action, source_id, raw_ns);
-        return ingress_post_event(EVENT_DOWN, source_id, raw_ns) ? JNI_TRUE : JNI_FALSE;
+        if (ingress_post_event(EVENT_DOWN, source_id, raw_ns)) {
+            add_suppressed_source(source_id);
+            return JNI_TRUE;
+        }
+        return JNI_FALSE;
     } else if (action == ACTION_UP || action == ACTION_POINTER_UP) {
+        if (!was_suppressed) {
+            return JNI_FALSE;
+        }
         log_touch_gate_limited("post_up", action, source_id, raw_ns);
         return ingress_post_event(EVENT_UP, source_id, raw_ns) ? JNI_TRUE : JNI_FALSE;
     }
@@ -2734,6 +2784,9 @@ Java_com_fizzd_connectedworlds_editorport_ExtraMenuUnityPlayerActivity_nativeOnK
         return JNI_FALSE;
     }
     ensure_input_thread_started();
+    if (close_capture_if_controller_paused_now()) {
+        return JNI_FALSE;
+    }
 
     KeyEventSnapshot native_event;
     int native_ok = native_key_snapshot(env, event, &native_event);
@@ -2774,9 +2827,21 @@ Java_com_fizzd_connectedworlds_editorport_ExtraMenuUnityPlayerActivity_nativeOnK
         raw_ns = java_event_time_ns(env, event);
     }
     int source_id = (SOURCE_KEYBOARD << 16) ^ (key_code & 0xffff);
+    if (!capture_accepts_raw_ns(raw_ns)) {
+        return JNI_FALSE;
+    }
+    int was_suppressed = 0;
     if (action == KEY_ACTION_DOWN) {
-        return ingress_post_event(EVENT_DOWN, source_id, raw_ns) ? JNI_TRUE : JNI_FALSE;
+        if (ingress_post_event(EVENT_DOWN, source_id, raw_ns)) {
+            add_suppressed_source(source_id);
+            return JNI_TRUE;
+        }
+        return JNI_FALSE;
     } else if (action == KEY_ACTION_UP) {
+        was_suppressed = remove_suppressed_source(source_id);
+        if (!was_suppressed) {
+            return JNI_FALSE;
+        }
         return ingress_post_event(EVENT_UP, source_id, raw_ns) ? JNI_TRUE : JNI_FALSE;
     }
     return JNI_FALSE;
@@ -3505,6 +3570,9 @@ static int try_controller_destination_state(void *controller_self, int *out_stat
 
 static int controller_allows_async_capture(void *controller_self) {
     if (controller_self == NULL) {
+        return 0;
+    }
+    if (controller_is_paused(controller_self)) {
         return 0;
     }
     if (!scene_allows_async_gameplay_cached()) {
@@ -5907,6 +5975,7 @@ static void *patch_thread_main(void *arg) {
             {"", "scrPlayer", "ValidInputWasTriggered", 0, (void *)&hooked_valid_triggered, (void **)&g_original_valid_triggered, "scrPlayer.ValidInputWasTriggered"},
             {"", "scrPlayer", "ValidInputWasReleased", 0, (void *)&hooked_valid_released, (void **)&g_original_valid_released, "scrPlayer.ValidInputWasReleased"},
             {"", "scrPlayer", "CountValidKeysPressed", 0, (void *)&hooked_count_valid_keys, (void **)&g_original_count_valid_keys, "scrPlayer.CountValidKeysPressed"},
+            {"", "scrPlayer", "get_touchEnabled", 0, (void *)&hooked_touch_enabled, (void **)&g_original_touch_enabled, "scrPlayer.get_touchEnabled"},
             {"", "scrPlayer", "get_holding", 0, (void *)&hooked_get_holding, (void **)&g_original_get_holding, "scrPlayer.get_holding"},
             {"", "scrPlayer", "get_auto", 0, (void *)&hooked_scrplayer_get_auto, (void **)&g_original_scrplayer_get_auto, "scrPlayer.get_auto"},
             {"", "scrPlayer", "Hit", 1, (void *)&hooked_scrplayer_hit, (void **)&g_original_scrplayer_hit, "scrPlayer.Hit"},

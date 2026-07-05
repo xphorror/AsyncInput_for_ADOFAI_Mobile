@@ -9,9 +9,11 @@
 ## 当前状态
 
 - 已支持 Android `dispatchTouchEvent` / `dispatchKeyEvent` 输入转发。
+- Java 转发层必须尊重 native 返回值：返回 `true` 表示事件已经被 async gameplay 管线消费，不应再交给 Unity 原始输入路径。
 - 已实现 native ingress 线程、虚拟 DateTime-like tick、`currFrameTick/offsetTick` 覆盖、六个 async mask replay。
 - 主 hook 点是 `scrController.PlayerControl_Update`，不会 inline hook Android IL2CPP 中 4 字节 `ret` stub 的 `scrController.UpdateInput`。
 - 多指和 multitap 使用稳定 async key slot，不再把所有物理输入折叠为单个 Space。
+- 暂停菜单/非 gameplay 状态会关闭 capture 并放行原始触摸，避免 async 管线吞掉 UI 事件。
 - `official_judgement.c` 保留为 trace/audit model，用于对照官方公式和状态推进，不是默认运行时判定接管方案。
 - AUTO/oldAuto 路径保留为 debug/test path，用于回归测试 async 状态机链路。
 
