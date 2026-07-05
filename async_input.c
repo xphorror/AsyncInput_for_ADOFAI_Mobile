@@ -102,7 +102,11 @@
 #define SYNTHETIC_TEST_SOURCE_ID 0x54455354
 #define SYNTHETIC_AUTO_UP_DELAY_NS 100000ULL
 #define SYNTHETIC_AUTO_NEXT_DOWN_GAP_NS 100000ULL
-#define SYNTHETIC_TEST_UP_DELAY_NS 50000000ULL
+#define SYNTHETIC_TEST_UP_DELAY_NS 4000000ULL
+#define SYNTHETIC_TEST_MULTI_TAP_GAP_NS 12000000ULL
+#define TEST_MACRO_HOLD_NONE 0
+#define TEST_MACRO_HOLD_RELEASE_UP 1
+#define TEST_MACRO_HOLD_END_TAP 2
 
 typedef enum AdoOfficialHitMargin {
     ADO_HIT_TOO_EARLY = 0,
@@ -284,6 +288,7 @@ typedef struct AsyncEvent {
     int type;
     int source_id;
     int synthetic_auto;
+    int synthetic_test;
 } AsyncEvent;
 
 typedef struct Il2CppApi {
@@ -497,6 +502,8 @@ static Il2CppMethodCache g_adobase_get_is_level_editor_method;
 static Il2CppMethodCache g_adobase_get_is_dlc_level_method;
 static Il2CppMethodCache g_adobase_get_scene_name_method;
 static Il2CppMethodCache g_editor_get_play_mode_method;
+static Il2CppMethodCache g_persistence_get_multitap_tile_behavior_method;
+static Il2CppMethodCache g_persistence_get_hold_behavior_method;
 static int g_mask_api_ready = 0;
 static int g_metadata_init_ready = 0;
 static int g_metadata_init_attempts = 0;
@@ -521,6 +528,7 @@ static int cache_method_from_class(void *class_ptr, const char *method_name, int
 static int hashset_count_if_ready(void *set);
 static int ensure_process_key_inputs_ready(void);
 static int read_static_bool_method(const char *namespaze, const char *klass, const char *method, Il2CppMethodCache *cache, int fallback);
+static int read_static_int_method(const char *namespaze, const char *klass, const char *method, Il2CppMethodCache *cache, int fallback);
 static double read_static_float_method(const char *namespaze, const char *klass, const char *method, Il2CppMethodCache *cache, double fallback);
 static void *read_static_object_method(const char *namespaze, const char *klass, const char *method, Il2CppMethodCache *cache);
 static double read_self_double_method(void *self, const char *namespaze, const char *klass, const char *method, Il2CppMethodCache *cache, double fallback);
@@ -594,6 +602,10 @@ static int g_last_test_macro_curr_seq = -1;
 static int g_last_test_macro_next_seq = -1;
 static int g_last_test_macro_taps_so_far = -1;
 static int g_last_test_macro_taps_on_floor = -1;
+static int g_test_macro_hold_active = 0;
+static int g_test_macro_hold_seq = -1;
+static uint64_t g_test_macro_hold_release_tick = 0;
+static int g_test_macro_hold_release_mode = 0;
 static IngressRecord g_ingress_queue[MAX_INGRESS_RECORDS];
 static int g_ingress_head = 0;
 static int g_ingress_count = 0;
@@ -896,12 +908,27 @@ static int __attribute__((unused)) synthetic_auto_pending_locked(void) {
     return 0;
 }
 
+static int is_synthetic_test_source(int source_id) {
+    return source_id >= SYNTHETIC_TEST_SOURCE_ID &&
+           source_id < SYNTHETIC_TEST_SOURCE_ID + ASYNC_KEY_SLOT_COUNT;
+}
+
 static int test_macro_input_idle(void) {
     pthread_mutex_lock(&g_lock);
-    int idle =
-        queue_active_count_locked() == 0 &&
-        g_held_count == 0 &&
-        logical_source_index_locked(SYNTHETIC_TEST_SOURCE_ID) < 0;
+    int test_held = 0;
+    for (int i = 0; i < g_held_count; ++i) {
+        if (is_synthetic_test_source(g_held_sources[i])) {
+            test_held = 1;
+            break;
+        }
+    }
+    int queue_empty = queue_active_count_locked() == 0;
+    int idle = 0;
+    if (queue_empty && g_test_macro_hold_active) {
+        idle = 1;
+    } else if (queue_empty) {
+        idle = g_held_count == 0 && !test_held;
+    }
     pthread_mutex_unlock(&g_lock);
     return idle;
 }
@@ -946,6 +973,10 @@ static void reset_test_macro_target_state_locked(void) {
     g_last_test_macro_next_seq = -1;
     g_last_test_macro_taps_so_far = -1;
     g_last_test_macro_taps_on_floor = -1;
+    g_test_macro_hold_active = 0;
+    g_test_macro_hold_seq = -1;
+    g_test_macro_hold_release_tick = 0;
+    g_test_macro_hold_release_mode = TEST_MACRO_HOLD_NONE;
 }
 
 static int test_macro_target_already_posted(int has_target_key,
@@ -961,7 +992,9 @@ static int test_macro_target_already_posted(int has_target_key,
          curr_seq == g_last_test_macro_curr_seq &&
          next_seq == g_last_test_macro_next_seq &&
          taps_so_far == g_last_test_macro_taps_so_far &&
-         taps_on_floor == g_last_test_macro_taps_on_floor);
+         taps_on_floor == g_last_test_macro_taps_on_floor &&
+         taps_so_far > 0 &&
+         taps_on_floor > 0);
     pthread_mutex_unlock(&g_lock);
     return already;
 }
@@ -1993,7 +2026,7 @@ static void enqueue_event(int type, int source_id, uint64_t raw_ns) {
     }
 
     int synthetic_auto = (source_id == SYNTHETIC_AUTO_SOURCE_ID);
-    int synthetic_test = (source_id == SYNTHETIC_TEST_SOURCE_ID);
+    int synthetic_test = is_synthetic_test_source(source_id);
     if (!synthetic_auto && !synthetic_test) {
         int physical_index = physical_source_index_locked(source_id);
         if (type == EVENT_DOWN) {
@@ -2045,6 +2078,7 @@ static void enqueue_event(int type, int source_id, uint64_t raw_ns) {
     g_queue[pos].type = type;
     g_queue[pos].source_id = source_id;
     g_queue[pos].synthetic_auto = synthetic_auto;
+    g_queue[pos].synthetic_test = synthetic_test;
     int queue_count_after = g_queue_count;
     pthread_mutex_unlock(&g_lock);
 
@@ -2121,6 +2155,7 @@ static int pop_events_for_tick(uint64_t max_tick, uint64_t *tick, int *down_coun
     }
 
     int first_type = g_queue[g_queue_head].type;
+    int first_synthetic_test = g_queue[g_queue_head].synthetic_test;
     int allow_down_burst = first_type == EVENT_DOWN && !g_queue[g_queue_head].synthetic_auto;
     uint64_t burst_limit = t;
     if (allow_down_burst) {
@@ -2144,6 +2179,7 @@ static int pop_events_for_tick(uint64_t max_tick, uint64_t *tick, int *down_coun
         int same_burst_down = allow_down_burst &&
                               g_queue[consume].type == EVENT_DOWN &&
                               !g_queue[consume].synthetic_auto &&
+                              (!first_synthetic_test || g_queue[consume].synthetic_test) &&
                               g_queue[consume].tick <= burst_limit;
         if (!same_tick && !same_burst_down) {
             break;
@@ -3923,6 +3959,45 @@ static uint64_t current_async_frame_tick_or_now(void) {
     return replay_target_tick_now();
 }
 
+static uint64_t target_song_tick_for_position(double song_position) {
+    if (!isfinite(song_position)) {
+        return 0;
+    }
+
+    void *conductor = read_static_object_method("", "scrConductor", "get_instance", &g_scrconductor_get_instance_method);
+    if (conductor == NULL) {
+        return 0;
+    }
+
+    void *song = NULL;
+    (void)read_instance_object_field(conductor, g_offset_scrconductor_song, &song);
+
+    double dsp_time_song = 0.0;
+    double add_offset = 0.0;
+    if (!read_instance_double_field(conductor, g_offset_scrconductor_dsp_time_song, &dsp_time_song) ||
+        !read_instance_double_field(conductor, g_offset_scrconductor_addoffset, &add_offset)) {
+        return 0;
+    }
+
+    double pitch = read_audio_source_pitch(song);
+    if (pitch == 0.0) {
+        pitch = 1.0;
+    }
+    double calibration_i = read_static_float_method(
+        "",
+        "scrConductor",
+        "get_calibration_i",
+        &g_scrconductor_get_calibration_i_method,
+        0.0);
+    double target_song_tick_d =
+        ((song_position + add_offset) / pitch + dsp_time_song + calibration_i) *
+        10000000.0;
+    if (!isfinite(target_song_tick_d) || target_song_tick_d <= 0.0) {
+        return 0;
+    }
+    return (uint64_t)(target_song_tick_d + 0.5);
+}
+
 static uint64_t target_tick_for_player(void *player_self, uint64_t fallback_tick, int apply_old_auto_margin, const char *trace_label) {
     if (player_self == NULL) {
         return fallback_tick;
@@ -4143,7 +4218,10 @@ static int post_test_macro_input_for_controller(void *controller_self) {
         g_offset_scrplanet_currfloor == 0 ||
         g_offset_scrfloor_seq_id == 0 ||
         g_offset_scrfloor_nextfloor == 0 ||
+        g_offset_scrfloor_taps_needed == 0 ||
         g_offset_scrfloor_taps_so_far == 0 ||
+        g_offset_scrfloor_hold_length == 0 ||
+        g_offset_scrfloor_entry_time == 0 ||
         g_offset_scrplayer_taps_on_this_floor == 0) {
         ensure_metadata_ready_lazy();
     }
@@ -4154,21 +4232,82 @@ static int post_test_macro_input_for_controller(void *controller_self) {
         return 0;
     }
     void *currfloor = NULL;
-    void *nextfloor = NULL;
+    void *target_floor = NULL;
+    void *after_target_floor = NULL;
     int curr_seq = -1;
-    int next_seq = -1;
-    int taps_so_far = -1;
+    int target_seq = -1;
+    int target_taps_so_far = -1;
     int taps_on_floor = -1;
+    int target_taps_needed = 1;
+    int target_hold_length = -1;
+    double hold_end_entry_time = 0.0;
     (void)read_instance_object_field(chosen_planet, g_offset_scrplanet_currfloor, &currfloor);
     if (currfloor != NULL) {
         (void)read_instance_int_field(currfloor, g_offset_scrfloor_seq_id, &curr_seq);
-        (void)read_instance_int_field(currfloor, g_offset_scrfloor_taps_so_far, &taps_so_far);
-        if (read_instance_object_field(currfloor, g_offset_scrfloor_nextfloor, &nextfloor) && nextfloor != NULL) {
-            (void)read_instance_int_field(nextfloor, g_offset_scrfloor_seq_id, &next_seq);
+        if (read_instance_object_field(currfloor, g_offset_scrfloor_nextfloor, &target_floor) && target_floor != NULL) {
+            (void)read_instance_int_field(target_floor, g_offset_scrfloor_seq_id, &target_seq);
+            (void)read_instance_int_field(target_floor, g_offset_scrfloor_taps_so_far, &target_taps_so_far);
+            (void)read_instance_int_field(target_floor, g_offset_scrfloor_taps_needed, &target_taps_needed);
+            (void)read_instance_int_field(target_floor, g_offset_scrfloor_hold_length, &target_hold_length);
+            if (read_instance_object_field(target_floor, g_offset_scrfloor_nextfloor, &after_target_floor) &&
+                after_target_floor != NULL) {
+                (void)read_instance_double_field(after_target_floor, g_offset_scrfloor_entry_time, &hold_end_entry_time);
+            }
         }
     }
     (void)read_instance_int_field(player_self, g_offset_scrplayer_taps_on_this_floor, &taps_on_floor);
-    int has_target_key = curr_seq >= 0 || next_seq >= 0 || taps_so_far >= 0 || taps_on_floor >= 0;
+    int has_target_key = curr_seq >= 0 || target_seq >= 0 || target_taps_so_far >= 0 || taps_on_floor >= 0;
+
+    if (g_test_macro_hold_active) {
+        uint64_t release_tick = g_test_macro_hold_release_tick;
+        int release_mode = g_test_macro_hold_release_mode;
+        if (release_tick == 0 || g_test_macro_hold_seq != curr_seq) {
+            if (release_mode == TEST_MACRO_HOLD_RELEASE_UP) {
+                (void)ingress_post_event(EVENT_UP, SYNTHETIC_TEST_SOURCE_ID, monotonic_ns_now());
+            }
+            g_test_macro_hold_active = 0;
+            g_test_macro_hold_seq = -1;
+            g_test_macro_hold_release_tick = 0;
+            g_test_macro_hold_release_mode = TEST_MACRO_HOLD_NONE;
+            return 0;
+        }
+
+        uint64_t raw_release = wall_tick_to_raw_ns(release_tick);
+        uint64_t raw_now = monotonic_ns_now();
+        int posted = 0;
+        if (release_mode == TEST_MACRO_HOLD_END_TAP) {
+            posted =
+                ingress_post_event(EVENT_DOWN, SYNTHETIC_TEST_SOURCE_ID, raw_release) &&
+                ingress_post_event(EVENT_UP, SYNTHETIC_TEST_SOURCE_ID, raw_release + SYNTHETIC_TEST_UP_DELAY_NS);
+        } else {
+            posted = ingress_post_event(EVENT_UP, SYNTHETIC_TEST_SOURCE_ID, raw_release);
+        }
+        if (!posted) {
+            return 0;
+        }
+
+        g_test_macro_hold_active = 0;
+        g_test_macro_hold_seq = -1;
+        g_test_macro_hold_release_tick = 0;
+        g_test_macro_hold_release_mode = TEST_MACRO_HOLD_NONE;
+
+        static uint64_t test_macro_hold_count = 0;
+        uint64_t hold_count = __atomic_add_fetch(&test_macro_hold_count, 1, __ATOMIC_RELAXED);
+        if (g_trace_enabled || hold_count <= 8 || (hold_count % 64ULL) == 0) {
+            LOGI("TEST macro hold end count=%" PRIu64
+                 " eventTick=%" PRIu64
+                 " mode=%d curr=%d target=%d rawRelease=%" PRIu64
+                 " rawNow=%" PRIu64,
+                 hold_count,
+                 release_tick,
+                 release_mode,
+                 curr_seq,
+                 target_seq,
+                 raw_release,
+                 raw_now);
+        }
+        return 1;
+    }
 
     uint64_t frame_tick = current_async_frame_tick_or_now();
     ensure_async_clock_fields(frame_tick, 100);
@@ -4178,8 +4317,8 @@ static int post_test_macro_input_for_controller(void *controller_self) {
     }
     if (test_macro_target_already_posted(has_target_key,
                                          curr_seq,
-                                         next_seq,
-                                         taps_so_far,
+                                         target_seq,
+                                         target_taps_so_far,
                                          taps_on_floor,
                                          event_tick)) {
         return 0;
@@ -4191,11 +4330,86 @@ static int post_test_macro_input_for_controller(void *controller_self) {
         return 0;
     }
     uint64_t raw_up = raw_down + SYNTHETIC_TEST_UP_DELAY_NS;
-    if (!ingress_post_event(EVENT_DOWN, SYNTHETIC_TEST_SOURCE_ID, raw_down) ||
-        !ingress_post_event(EVENT_UP, SYNTHETIC_TEST_SOURCE_ID, raw_up)) {
-        return 0;
+    uint64_t hold_release_tick = 0;
+    int multitap_behavior = read_static_int_method(
+        "",
+        "Persistence",
+        "get_multiTapTileBehavior",
+        &g_persistence_get_multitap_tile_behavior_method,
+        0);
+    int hold_behavior = read_static_int_method(
+        "",
+        "Persistence",
+        "get_holdBehavior",
+        &g_persistence_get_hold_behavior_method,
+        0);
+    if (hold_behavior < 0 || hold_behavior > 2) {
+        hold_behavior = 0;
     }
-    remember_test_macro_target(curr_seq, next_seq, taps_so_far, taps_on_floor, event_tick);
+    int hit_once_multitap = multitap_behavior == 1;
+    int current_taps = taps_on_floor > target_taps_so_far ? taps_on_floor : target_taps_so_far;
+    if (current_taps < 0) {
+        current_taps = 0;
+    }
+    int taps_remaining = target_taps_needed - current_taps;
+    if (taps_remaining < 1) {
+        taps_remaining = 1;
+    }
+    if (taps_remaining > ASYNC_KEY_SLOT_COUNT) {
+        taps_remaining = ASYNC_KEY_SLOT_COUNT;
+    }
+    int tap_events = hit_once_multitap ? 1 : taps_remaining;
+    if (target_hold_length > -1 && hold_end_entry_time > 0.0) {
+        uint64_t offset_tick = 0;
+        (void)read_static_u64_field(g_field_async_offset_tick, &offset_tick);
+        uint64_t hold_song_tick = target_song_tick_for_position(hold_end_entry_time);
+        if (hold_song_tick != 0) {
+            hold_release_tick = offset_tick + hold_song_tick;
+            uint64_t final_hold_down_raw =
+                raw_down + (uint64_t)(tap_events - 1) * SYNTHETIC_TEST_MULTI_TAP_GAP_NS;
+            uint64_t final_hold_down_tick = raw_ns_to_wall_tick(final_hold_down_raw);
+            if (hold_release_tick <= final_hold_down_tick) {
+                hold_release_tick = 0;
+            }
+        }
+    }
+    if (hold_release_tick != 0) {
+        for (int i = 0; i < tap_events - 1; ++i) {
+            uint64_t tap_down = raw_down + (uint64_t)i * SYNTHETIC_TEST_MULTI_TAP_GAP_NS;
+            uint64_t tap_up = tap_down + SYNTHETIC_TEST_UP_DELAY_NS;
+            int source_id = SYNTHETIC_TEST_SOURCE_ID + i;
+            if (!ingress_post_event(EVENT_DOWN, source_id, tap_down) ||
+                !ingress_post_event(EVENT_UP, source_id, tap_up)) {
+                return 0;
+            }
+        }
+
+        uint64_t hold_down_raw = raw_down + (uint64_t)(tap_events - 1) * SYNTHETIC_TEST_MULTI_TAP_GAP_NS;
+        if (!ingress_post_event(EVENT_DOWN, SYNTHETIC_TEST_SOURCE_ID, hold_down_raw)) {
+            return 0;
+        }
+        g_test_macro_hold_active = 1;
+        g_test_macro_hold_seq = target_seq;
+        g_test_macro_hold_release_tick = hold_release_tick;
+        g_test_macro_hold_release_mode =
+            (hold_behavior == 2) ? TEST_MACRO_HOLD_END_TAP : TEST_MACRO_HOLD_RELEASE_UP;
+        if (g_test_macro_hold_release_mode == TEST_MACRO_HOLD_END_TAP) {
+            if (!ingress_post_event(EVENT_UP, SYNTHETIC_TEST_SOURCE_ID, hold_down_raw + SYNTHETIC_TEST_UP_DELAY_NS)) {
+                return 0;
+            }
+        }
+    } else {
+        for (int i = 0; i < tap_events; ++i) {
+            uint64_t tap_down = raw_down + (uint64_t)i * SYNTHETIC_TEST_MULTI_TAP_GAP_NS;
+            uint64_t tap_up = tap_down + SYNTHETIC_TEST_UP_DELAY_NS;
+            int source_id = SYNTHETIC_TEST_SOURCE_ID + i;
+            if (!ingress_post_event(EVENT_DOWN, source_id, tap_down) ||
+                !ingress_post_event(EVENT_UP, source_id, tap_up)) {
+                return 0;
+            }
+        }
+    }
+    remember_test_macro_target(curr_seq, target_seq, target_taps_so_far, taps_on_floor, event_tick);
 
     static uint64_t test_macro_count = 0;
     uint64_t count = __atomic_add_fetch(&test_macro_count, 1, __ATOMIC_RELAXED);
@@ -4203,17 +4417,26 @@ static int post_test_macro_input_for_controller(void *controller_self) {
         LOGI("TEST macro posted count=%" PRIu64
              " eventTick=%" PRIu64
              " frameTick=%" PRIu64
-             " curr=%d next=%d taps=%d/%d"
+             " curr=%d target=%d taps=%d/%d"
+             " tapsNeeded=%d tapsPosted=%d multitapBehavior=%d holdBehavior=%d holdLength=%d holdMode=%d"
              " rawDown=%" PRIu64
+             " rawUp=%" PRIu64
              " rawNow=%" PRIu64,
              count,
              event_tick,
              frame_tick,
              curr_seq,
-             next_seq,
-             taps_so_far,
+             target_seq,
+             target_taps_so_far,
              taps_on_floor,
+             target_taps_needed,
+             tap_events,
+             multitap_behavior,
+             hold_behavior,
+             target_hold_length,
+             g_test_macro_hold_release_mode,
              raw_down,
+             hold_release_tick != 0 ? wall_tick_to_raw_ns(hold_release_tick) : raw_up,
              raw_now);
     }
     return 1;
@@ -5193,6 +5416,14 @@ static int read_static_bool_method(const char *namespaze, const char *klass, con
     return fn(cache->method_info) ? 1 : 0;
 }
 
+static int read_static_int_method(const char *namespaze, const char *klass, const char *method, Il2CppMethodCache *cache, int fallback) {
+    if (!ensure_method_cache(namespaze, klass, method, 0, cache)) {
+        return fallback;
+    }
+    IntStaticFn fn = (IntStaticFn)cache->method_pointer;
+    return fn(cache->method_info);
+}
+
 static int read_rdc_auto(int *out) {
     if (out == NULL || !ensure_method_cache("", "RDC", "get_auto", 0, &g_rdc_get_auto_method)) {
         return 0;
@@ -5900,6 +6131,8 @@ static void reset_metadata_state(void) {
     memset(&g_adobase_get_is_dlc_level_method, 0, sizeof(g_adobase_get_is_dlc_level_method));
     memset(&g_adobase_get_scene_name_method, 0, sizeof(g_adobase_get_scene_name_method));
     memset(&g_editor_get_play_mode_method, 0, sizeof(g_editor_get_play_mode_method));
+    memset(&g_persistence_get_multitap_tile_behavior_method, 0, sizeof(g_persistence_get_multitap_tile_behavior_method));
+    memset(&g_persistence_get_hold_behavior_method, 0, sizeof(g_persistence_get_hold_behavior_method));
 }
 
 static void resolve_async_metadata_fields(void) {
