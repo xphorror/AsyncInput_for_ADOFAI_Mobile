@@ -59,6 +59,10 @@ offsetTick = asyncNowTick - dspTime * 10000000
 - `AsyncInputManager.offsetTick`
 - `AsyncInputManager.offsetTickUpdated`
 
+当前实现按 PC-like 方式维护 `offsetTick`：`fixDivider <= 1` 或 session hard reset 时直接对齐，其余帧按 `delta / fixDivider` 平滑更新。这样避免每帧硬覆盖导致的时间桥抖动，也避免 gameplay 判定 tick 被 lifecycle soft pause 的虚拟时钟基准影响。
+
+官方 `scrPlanet.SwitchChosen()` 的命中判定读取 `cachedAngle`。mask replay 在调用官方判定前会把 `angle` 和 `cachedAngle` 同时投影到当前 `eventTick`，保证 `GetHitMargin(cachedAngle, targetExitAngle, ...)` 看到的是同一个目标时间点。
+
 ## 输入 gate
 
 `AsyncInputManager.isActive` 不是简单等于“模块开关开启”。它只在 gameplay replay-ready 状态返回 true。
@@ -101,6 +105,23 @@ Java 层必须使用 native 返回值作为消费信号：
 - native 返回 `false`：事件不是 async gameplay 输入，或者当前处于暂停/UI/非 capture 状态，Java 应继续交给 `super.dispatchTouchEvent` / `super.dispatchKeyEvent`。
 
 真实触摸在 replay 时还需要屏蔽官方 mobile `touchEnabled` 分支，否则同一个触摸可能同时被 `Input.touches` 和 async mask 计数。当前 hook 只在 mask replay 范围内让 `scrPlayer.get_touchEnabled` 返回 false，不影响菜单和普通官方输入路径。
+
+## 测试宏
+
+测试宏通过导出函数控制：
+
+- `ADOFAIAsyncInput_SetTestMacroEnabled(int enabled)`
+- `ADOFAIAsyncInput_IsTestMacroEnabled()`
+
+它用于验证内部异步链路：
+
+```text
+target floor -> synthetic raw_ns -> eventTick -> queue -> mask -> ProcessKeyInputs
+```
+
+测试宏不是完整真实触摸基准。它不会覆盖 Android 触摸采样、Java/Native 转发、系统输入调度或多指硬件行为；这些仍需要真实触摸测试。宏稳定只能说明内部 replay/判定链路稳定。
+
+为避免污染基准，测试宏只在当前队列空、没有 held source、测试宏源未按住时投递下一击。测试宏启用且 gameplay gate 打开时，玩家触摸/键盘 gameplay 输入会被消费掉，不进入 async 队列，也不继续转发给 Unity。移动端 UI 区域触摸仍会透传给菜单/暂停界面。
 
 ## Trace / Audit
 

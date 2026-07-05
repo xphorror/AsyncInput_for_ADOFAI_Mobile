@@ -16,6 +16,7 @@
 - 暂停菜单/非 gameplay 状态会关闭 capture 并放行原始触摸，避免 async 管线吞掉 UI 事件。
 - `official_judgement.c` 保留为 trace/audit model，用于对照官方公式和状态推进，不是默认运行时判定接管方案。
 - AUTO/oldAuto 路径保留为 debug/test path，用于回归测试 async 状态机链路。
+- 内置异步测试宏可用于压测 `eventTick -> mask -> ProcessKeyInputs` 链路。测试宏启用且处于播放态时会屏蔽玩家 gameplay 输入，避免人工触摸污染基准样本。
 
 ## 限制
 
@@ -67,6 +68,7 @@ out/arm64-v8a/libAsyncInput.so
 /data/data/<PackageName>/files/adofai_async_input.cfg
 /data/data/<PackageName>/files/adofai_async_auto_replay.cfg
 /data/data/<PackageName>/files/adofai_async_trace.cfg
+/data/data/<PackageName>/files/adofai_async_test_macro.cfg
 ```
 
 ## 编译 Java 转发示例
