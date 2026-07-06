@@ -286,6 +286,7 @@ typedef struct AsyncKeyCodeValue {
 
 typedef struct AsyncEvent {
     uint64_t tick;
+    uint64_t offset_tick;
     int type;
     int source_id;
     int synthetic_auto;
@@ -382,6 +383,7 @@ static volatile int g_forced_hit_margin_active = 0;
 static volatile int g_forced_hit_margin_value = 3;
 static volatile uint64_t g_current_replay_trace_id = 0;
 static volatile uint64_t g_current_replay_tick = 0;
+static volatile uint64_t g_current_replay_offset_tick = 0;
 static volatile int g_current_replay_down = 0;
 static volatile int g_current_replay_up = 0;
 static volatile int g_current_replay_held = 0;
@@ -623,6 +625,7 @@ static uint64_t g_virtual_base_tick = 0;
 static uint64_t g_virtual_pause_tick = 0;
 static int g_virtual_resumed_from_pause = 0;
 static uint64_t g_last_async_frame_tick = 0;
+static uint64_t g_last_async_offset_tick = 0;
 static int g_async_offset_needs_hard_reset = 1;
 static volatile int g_managed_masks_need_clear = 0;
 static int g_replay_mode = REPLAY_MODE_NONE;
@@ -766,6 +769,7 @@ static void virtual_clock_reset(uint64_t raw_ns) {
 
     pthread_mutex_lock(&g_async_clock_lock);
     g_last_async_frame_tick = 0;
+    g_last_async_offset_tick = 0;
     g_async_offset_needs_hard_reset = 1;
     pthread_mutex_unlock(&g_async_clock_lock);
 
@@ -1036,6 +1040,11 @@ static void clear_runtime_state_locked(void) {
     g_current_frame_tick = 0;
     g_current_frame_tick_ready = 0;
     g_last_auto_synthetic_down_raw_ns = 0;
+    pthread_mutex_lock(&g_async_clock_lock);
+    g_last_async_frame_tick = 0;
+    g_last_async_offset_tick = 0;
+    g_async_offset_needs_hard_reset = 1;
+    pthread_mutex_unlock(&g_async_clock_lock);
     reset_test_macro_target_state_locked();
     g_managed_masks_need_clear = 1;
 }
@@ -1994,6 +2003,9 @@ static void ensure_async_clock_fields(uint64_t tick, int64_t fix_divider) {
     if (should_write) {
         write_static_u64_field(g_field_async_offset_tick, new_offset);
         write_static_bool_field(g_field_async_offset_tick_updated, 1);
+        pthread_mutex_lock(&g_async_clock_lock);
+        g_last_async_offset_tick = new_offset;
+        pthread_mutex_unlock(&g_async_clock_lock);
         static uint64_t offset_log_count = 0;
         uint64_t count = __atomic_add_fetch(&offset_log_count, 1, __ATOMIC_RELAXED);
         if (g_trace_enabled && (count <= 8 || (count % 512ULL) == 0)) {
@@ -2079,6 +2091,9 @@ static void enqueue_event(int type, int source_id, uint64_t raw_ns) {
         pos--;
     }
     g_queue[pos].tick = raw_ns;
+    pthread_mutex_lock(&g_async_clock_lock);
+    g_queue[pos].offset_tick = g_last_async_offset_tick;
+    pthread_mutex_unlock(&g_async_clock_lock);
     g_queue[pos].type = type;
     g_queue[pos].source_id = source_id;
     g_queue[pos].synthetic_auto = synthetic_auto;
@@ -2135,6 +2150,7 @@ static int prepare_replay_step(uint64_t target_tick, uint64_t *step_limit) {
 
 static int pop_events_for_tick(uint64_t max_tick,
                                uint64_t *tick,
+                               uint64_t *offset_tick,
                                int *down_count,
                                int *up_count,
                                int *held_count,
@@ -2151,6 +2167,7 @@ static int pop_events_for_tick(uint64_t max_tick,
     }
 
     uint64_t t = g_queue[g_queue_head].tick;
+    uint64_t event_offset_tick = g_queue[g_queue_head].offset_tick;
     if (t > max_tick) {
         int qcount_dbg = queue_active_count_locked();
         pthread_mutex_unlock(&g_lock);
@@ -2240,6 +2257,9 @@ static int pop_events_for_tick(uint64_t max_tick,
     g_last_processed_tick = t;
 
     *tick = t;
+    if (offset_tick != NULL) {
+        *offset_tick = event_offset_tick;
+    }
     *down_count = down;
     *up_count = up;
     if (held_count != NULL) {
@@ -3566,7 +3586,12 @@ static int project_planet_angle_from_tick(void *player, void *planet, uint64_t t
     }
 
     uint64_t offset_tick = 0;
-    (void)read_static_u64_field(g_field_async_offset_tick, &offset_tick);
+    uint64_t replay_offset_tick = __atomic_load_n(&g_current_replay_offset_tick, __ATOMIC_ACQUIRE);
+    if (g_in_async_replay && replay_offset_tick != 0) {
+        offset_tick = replay_offset_tick;
+    } else {
+        (void)read_static_u64_field(g_field_async_offset_tick, &offset_tick);
+    }
     uint64_t target_song_tick = target_tick > offset_tick ? target_tick - offset_tick : target_tick;
     write_static_u64_field(g_field_async_target_song_tick, target_song_tick);
 
@@ -3976,7 +4001,12 @@ static int __attribute__((unused)) capture_accepts_raw_ns(uint64_t raw_ns) {
     return raw_ns > g_capture_floor_raw_ns;
 }
 
-static void call_process_key_inputs(void *controller_self, uint64_t tick, int replay_mode, int synthetic_auto, int synthetic_test) {
+static void call_process_key_inputs(void *controller_self,
+                                    uint64_t tick,
+                                    uint64_t event_offset_tick,
+                                    int replay_mode,
+                                    int synthetic_auto,
+                                    int synthetic_test) {
     if (controller_self == NULL || !ensure_process_key_inputs_ready()) {
         return;
     }
@@ -3985,6 +4015,7 @@ static void call_process_key_inputs(void *controller_self, uint64_t tick, int re
     int prev_replay_mode = g_replay_mode;
     uint64_t prev_trace_id = __atomic_load_n(&g_current_replay_trace_id, __ATOMIC_ACQUIRE);
     uint64_t prev_replay_tick = __atomic_load_n(&g_current_replay_tick, __ATOMIC_ACQUIRE);
+    uint64_t prev_replay_offset_tick = __atomic_load_n(&g_current_replay_offset_tick, __ATOMIC_ACQUIRE);
     int prev_replay_down = __atomic_load_n(&g_current_replay_down, __ATOMIC_ACQUIRE);
     int prev_replay_up = __atomic_load_n(&g_current_replay_up, __ATOMIC_ACQUIRE);
     int prev_replay_held = __atomic_load_n(&g_current_replay_held, __ATOMIC_ACQUIRE);
@@ -3996,20 +4027,32 @@ static void call_process_key_inputs(void *controller_self, uint64_t tick, int re
     int trace_down = snapshot_down();
     int trace_up = snapshot_up();
     int trace_held = snapshot_held();
+    uint64_t previous_offset_tick = 0;
+    int restore_offset_tick = 0;
+    if (tick != 0 &&
+        event_offset_tick != 0 &&
+        g_field_async_offset_tick != NULL &&
+        g_field_async_offset_tick_updated != NULL) {
+        (void)read_static_u64_field(g_field_async_offset_tick, &previous_offset_tick);
+        write_static_u64_field(g_field_async_offset_tick, event_offset_tick);
+        write_static_bool_field(g_field_async_offset_tick_updated, 1);
+        restore_offset_tick = 1;
+    }
     if (tick != 0) {
         trace_id = __atomic_add_fetch(&g_replay_event_count, 1, __ATOMIC_RELAXED);
         if (g_trace_enabled && (trace_id <= 8 || (trace_id % 64ULL) == 0)) {
-            LOGI("TRACE replay id=%" PRIu64 " tick=%" PRIu64 " mode=%d down=%d up=%d held=%d syntheticAuto=%d syntheticTest=%d",
-                 trace_id, tick, replay_mode, trace_down, trace_up, trace_held, synthetic_auto ? 1 : 0, synthetic_test ? 1 : 0);
+            LOGI("TRACE replay id=%" PRIu64 " tick=%" PRIu64 " eventOffset=%" PRIu64 " mode=%d down=%d up=%d held=%d syntheticAuto=%d syntheticTest=%d",
+                 trace_id, tick, event_offset_tick, replay_mode, trace_down, trace_up, trace_held, synthetic_auto ? 1 : 0, synthetic_test ? 1 : 0);
         }
         if (g_trace_enabled) {
-            LOGI("TRACE call id=%" PRIu64 " tick=%" PRIu64 " mode=%d down=%d up=%d held=%d syntheticAuto=%d syntheticTest=%d",
-                 trace_id, tick, replay_mode, trace_down, trace_up, trace_held, synthetic_auto ? 1 : 0, synthetic_test ? 1 : 0);
+            LOGI("TRACE call id=%" PRIu64 " tick=%" PRIu64 " eventOffset=%" PRIu64 " mode=%d down=%d up=%d held=%d syntheticAuto=%d syntheticTest=%d",
+                 trace_id, tick, event_offset_tick, replay_mode, trace_down, trace_up, trace_held, synthetic_auto ? 1 : 0, synthetic_test ? 1 : 0);
         }
     }
     ProcessKeyInputsFn fn = (ProcessKeyInputsFn)g_process_key_inputs_method.method_pointer;
     __atomic_store_n(&g_current_replay_trace_id, trace_id, __ATOMIC_RELEASE);
     __atomic_store_n(&g_current_replay_tick, tick, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_current_replay_offset_tick, event_offset_tick, __ATOMIC_RELEASE);
     __atomic_store_n(&g_current_replay_down, trace_down, __ATOMIC_RELEASE);
     __atomic_store_n(&g_current_replay_up, trace_up, __ATOMIC_RELEASE);
     __atomic_store_n(&g_current_replay_held, trace_held, __ATOMIC_RELEASE);
@@ -4021,10 +4064,15 @@ static void call_process_key_inputs(void *controller_self, uint64_t tick, int re
         shadow_judgement_before_process(controller_self, tick, replay_mode);
     }
     fn(controller_self, tick, g_process_key_inputs_method.method_info);
+    if (restore_offset_tick) {
+        write_static_u64_field(g_field_async_offset_tick, previous_offset_tick);
+        write_static_bool_field(g_field_async_offset_tick_updated, 1);
+    }
     g_replay_mode = prev_replay_mode;
     g_in_async_replay = prev_in_async_replay;
     __atomic_store_n(&g_current_replay_trace_id, prev_trace_id, __ATOMIC_RELEASE);
     __atomic_store_n(&g_current_replay_tick, prev_replay_tick, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_current_replay_offset_tick, prev_replay_offset_tick, __ATOMIC_RELEASE);
     __atomic_store_n(&g_current_replay_down, prev_replay_down, __ATOMIC_RELEASE);
     __atomic_store_n(&g_current_replay_up, prev_replay_up, __ATOMIC_RELEASE);
     __atomic_store_n(&g_current_replay_held, prev_replay_held, __ATOMIC_RELEASE);
@@ -4256,7 +4304,7 @@ static int consume_auto_hit_via_async_state_machine(void *player_self) {
 
     apply_primary_key_masks(1, 0, 1);
     __atomic_store_n(&g_in_auto_state_machine_replay, 1, __ATOMIC_RELEASE);
-    call_process_key_inputs(controller_self, tick, REPLAY_MODE_MASK, 1, 0);
+    call_process_key_inputs(controller_self, tick, 0, REPLAY_MODE_MASK, 1, 0);
     __atomic_store_n(&g_in_auto_state_machine_replay, 0, __ATOMIC_RELEASE);
     restore_async_angle_to_tick(controller_self, frame_tick);
     write_rdc_auto(old_rdc_auto);
@@ -4613,6 +4661,7 @@ static int replay_pending_events_via_process_key_inputs(void *controller_self, u
     }
 
     uint64_t event_raw_ns = 0;
+    uint64_t event_offset_tick = 0;
     int down = 0;
     int up = 0;
     int held = 0;
@@ -4625,7 +4674,7 @@ static int replay_pending_events_via_process_key_inputs(void *controller_self, u
     pthread_mutex_lock(&g_lock);
     had_pending = queue_active_count_locked() > 0;
     pthread_mutex_unlock(&g_lock);
-    while (replayed < MAX_EVENTS && pop_events_for_tick(now_raw_ns, &event_raw_ns, &down, &up, &held, &synthetic_auto, &synthetic_test)) {
+    while (replayed < MAX_EVENTS && pop_events_for_tick(now_raw_ns, &event_raw_ns, &event_offset_tick, &down, &up, &held, &synthetic_auto, &synthetic_test)) {
         if (!controller_allows_async_replay(controller_self)) {
             if (!controller_allows_async_capture(controller_self)) {
                 stop_capture_and_clear_queue();
@@ -4641,12 +4690,12 @@ static int replay_pending_events_via_process_key_inputs(void *controller_self, u
         }
 
         uint64_t event_tick = raw_ns_to_wall_tick(event_raw_ns);
-        call_process_key_inputs(controller_self, event_tick, replay_mode, synthetic_auto > 0, synthetic_test > 0);
+        call_process_key_inputs(controller_self, event_tick, event_offset_tick, replay_mode, synthetic_auto > 0, synthetic_test > 0);
         clear_frame_edges();
         replayed++;
     }
     if (replay_mode == REPLAY_MODE_MASK && replayed == 0 && !had_pending) {
-        call_process_key_inputs(controller_self, 0, replay_mode, 0, 0);
+        call_process_key_inputs(controller_self, 0, 0, replay_mode, 0, 0);
     } else if (replay_mode == REPLAY_MODE_MASK && replayed > 0) {
         restore_async_angle_to_tick(controller_self, target_tick);
     }
@@ -4774,7 +4823,7 @@ static void hooked_update_input(void *self, void *method) {
             LOGW("mask API unavailable, using legacy replay fallback for this frame");
         }
         replay_pending_events_via_process_key_inputs(self, target_tick, REPLAY_MODE_LEGACY);
-        call_process_key_inputs(self, 0, REPLAY_MODE_LEGACY, 0, 0);
+        call_process_key_inputs(self, 0, 0, REPLAY_MODE_LEGACY, 0, 0);
         g_current_controller_self = NULL;
         return;
     }
@@ -4839,7 +4888,7 @@ static int __attribute__((unused)) replay_pending_events(void *player_self) {
     uint64_t step_limit = 0;
     while (steps < REPLAY_MAX_STEPS_PER_FRAME && prepare_replay_step(target_tick, &step_limit)) {
         steps++;
-        while (pop_events_for_tick(step_limit, &tick, &down, &up, NULL, NULL, NULL)) {
+        while (pop_events_for_tick(step_limit, &tick, NULL, &down, &up, NULL, NULL, NULL)) {
             (void)down;
             (void)up;
             if (!controller_allows_async_replay(g_current_controller_self)) {
@@ -5754,7 +5803,10 @@ static void shadow_judgement_before_process(void *controller_self, uint64_t tick
     }
 
     uint64_t offset_tick = 0;
-    if (g_field_async_offset_tick != NULL) {
+    uint64_t replay_offset_tick = __atomic_load_n(&g_current_replay_offset_tick, __ATOMIC_ACQUIRE);
+    if (replay_offset_tick != 0) {
+        offset_tick = replay_offset_tick;
+    } else if (g_field_async_offset_tick != NULL) {
         (void)read_static_u64_field(g_field_async_offset_tick, &offset_tick);
     }
     uint64_t target_song_tick = tick;
