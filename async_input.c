@@ -9,6 +9,7 @@
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
@@ -19,6 +20,9 @@
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+
+#define ADO_LIKELY(x) __builtin_expect(!!(x), 1)
+#define ADO_UNLIKELY(x) __builtin_expect(!!(x), 0)
 
 #define PACKAGE_NAME "com.fizzd.connectedworlds.leveleditor.debug"
 #define CFG_PATH "/data/data/" PACKAGE_NAME "/files/adofai_async_input.cfg"
@@ -83,6 +87,15 @@
 #define CAPTURE_START_SUPPRESS_NS 250000000ULL
 #define MULTITAP_BURST_NS 8000000ULL
 #define CAPTURE_STALE_TICKS 10000000ULL
+/*
+ * CLOCK_REALTIME and CLOCK_MONOTONIC only slew apart by NTP correction
+ * (<= 500 ppm, i.e. a few ns per frame), so 20 ms is far above the noise floor
+ * yet far below any suspend long enough to hurt judgement. The sample window
+ * bounds how wide the uptime->wall->uptime sandwich may be before the sample is
+ * rejected as preempted.
+ */
+#define CLOCK_ORIGIN_DRIFT_TOLERANCE_TICKS 200000ULL
+#define CLOCK_ORIGIN_SAMPLE_WINDOW_TICKS 10000ULL
 #define REPLAY_TICK_STEP_TICKS 10000ULL
 #define REPLAY_MAX_STEPS_PER_FRAME MAX_EVENTS
 #define IL2CPP_BASE_WAIT_ATTEMPTS 120
@@ -108,6 +121,10 @@
 #define TEST_MACRO_HOLD_NONE 0
 #define TEST_MACRO_HOLD_RELEASE_UP 1
 #define TEST_MACRO_HOLD_END_TAP 2
+#define ASYNC_CONTROL_ENABLED 0
+#define ASYNC_CONTROL_AUTO_REPLAY 1
+#define ASYNC_CONTROL_TRACE 2
+#define ASYNC_CONTROL_TEST_MACRO 3
 
 typedef enum AdoOfficialHitMargin {
     ADO_HIT_TOO_EARLY = 0,
@@ -253,6 +270,7 @@ typedef const void *(*InputEventFromJavaFn)(JNIEnv *env, jobject event);
 typedef int64_t (*InputEventGetTimeFn)(const void *event);
 typedef void (*InputEventReleaseFn)(const void *event);
 typedef int32_t (*InputEventGetSourceFn)(const void *event);
+typedef int32_t (*InputEventGetIntFn)(const void *event);
 typedef int32_t (*MotionEventGetActionFn)(const void *event);
 typedef size_t (*MotionEventGetPointerCountFn)(const void *event);
 typedef int32_t (*MotionEventGetPointerIdFn)(const void *event, size_t pointer_index);
@@ -342,7 +360,10 @@ typedef struct MotionEventSnapshot {
     int action;
     int index;
     int pointer_id;
+    int pointer_count;
     int source;
+    int device_id;
+    int android_flags;
     int has_xy;
     float x;
     float y;
@@ -352,8 +373,12 @@ typedef struct MotionEventSnapshot {
 typedef struct KeyEventSnapshot {
     int action;
     int key_code;
+    int scan_code;
     int meta_state;
+    int device_id;
     int repeat_count;
+    int source;
+    int android_flags;
     uint64_t raw_ns;
 } KeyEventSnapshot;
 
@@ -371,6 +396,7 @@ static volatile int g_auto_replay_enabled = 1;
 static volatile int g_trace_enabled = 0;
 static volatile int g_test_macro_enabled = 0;
 static volatile int g_hooks_installed = 0;
+static pthread_mutex_t g_control_lock = PTHREAD_MUTEX_INITIALIZER;
 static volatile int g_in_async_replay = 0;
 static volatile int g_current_replay_is_synthetic_auto = 0;
 static volatile int g_current_replay_is_synthetic_test = 0;
@@ -649,15 +675,19 @@ static InputEventGetTimeFn g_motion_event_get_time = NULL;
 static InputEventGetTimeFn g_key_event_get_time = NULL;
 static InputEventReleaseFn g_input_event_release = NULL;
 static InputEventGetSourceFn g_input_event_get_source = NULL;
+static InputEventGetIntFn g_input_event_get_device_id = NULL;
 static MotionEventGetActionFn g_motion_event_get_action = NULL;
 static MotionEventGetPointerCountFn g_motion_event_get_pointer_count = NULL;
 static MotionEventGetPointerIdFn g_motion_event_get_pointer_id = NULL;
 static MotionEventGetCoordFn g_motion_event_get_x = NULL;
 static MotionEventGetCoordFn g_motion_event_get_y = NULL;
+static InputEventGetIntFn g_motion_event_get_flags = NULL;
 static KeyEventGetIntFn g_key_event_get_action = NULL;
 static KeyEventGetIntFn g_key_event_get_key_code = NULL;
+static KeyEventGetIntFn g_key_event_get_scan_code = NULL;
 static KeyEventGetIntFn g_key_event_get_meta_state = NULL;
 static KeyEventGetIntFn g_key_event_get_repeat_count = NULL;
+static KeyEventGetIntFn g_key_event_get_flags = NULL;
 
 typedef struct MotionMethodCache {
     int ready;
@@ -665,7 +695,10 @@ typedef struct MotionMethodCache {
     jmethodID getActionMasked;
     jmethodID getActionIndex;
     jmethodID getPointerId;
+    jmethodID getPointerCount;
     jmethodID getSource;
+    jmethodID getDeviceId;
+    jmethodID getFlags;
     jmethodID getX;
     jmethodID getY;
 } MotionMethodCache;
@@ -675,8 +708,12 @@ typedef struct KeyMethodCache {
     jclass cls;
     jmethodID getAction;
     jmethodID getKeyCode;
+    jmethodID getScanCode;
     jmethodID getMetaState;
+    jmethodID getDeviceId;
     jmethodID getRepeatCount;
+    jmethodID getSource;
+    jmethodID getFlags;
 } KeyMethodCache;
 
 static pthread_mutex_t g_jni_cache_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -723,24 +760,104 @@ static uint64_t monotonic_ns_now(void) {
     return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
 }
 
-static void update_time_origin(void) {
+/*
+ * CLOCK_MONOTONIC stops during system suspend while CLOCK_REALTIME keeps
+ * running, so the wall-minus-uptime bridge silently goes stale across a screen
+ * lock. Event ticks come from CLOCK_MONOTONIC through this bridge while frame
+ * ticks come straight from CLOCK_REALTIME; once the bridge is stale the two
+ * leave the shared DateTime-like domain that ProcessKeyInputs requires and
+ * every replayed event lands one suspend-duration in the past.
+ *
+ * Sample the origin with an uptime->wall->uptime sandwich so preemption between
+ * the two clock reads cannot masquerade as real drift, and reject the sample
+ * when the sandwich is too wide to trust.
+ */
+static int sample_time_origin(uint64_t *origin_out) {
+    if (origin_out == NULL) {
+        return 0;
+    }
+    uint64_t up_before = uptime_ticks_now();
     uint64_t wall = wall_ticks_now();
-    uint64_t up = uptime_ticks_now();
-    g_wall_minus_uptime_ticks = wall - up;
+    uint64_t up_after = uptime_ticks_now();
+    if (up_after < up_before) {
+        return 0;
+    }
+    uint64_t window = up_after - up_before;
+    if (window > CLOCK_ORIGIN_SAMPLE_WINDOW_TICKS) {
+        return 0;
+    }
+    *origin_out = wall - (up_before + window / 2ULL);
+    return 1;
+}
+
+static void store_time_origin(uint64_t origin) {
+    __atomic_store_n(&g_wall_minus_uptime_ticks, origin, __ATOMIC_RELAXED);
+}
+
+static uint64_t load_time_origin(void) {
+    uint64_t origin = __atomic_load_n(&g_wall_minus_uptime_ticks, __ATOMIC_RELAXED);
+    if (origin != 0) {
+        return origin;
+    }
+    if (!sample_time_origin(&origin)) {
+        origin = wall_ticks_now() - uptime_ticks_now();
+    }
+    store_time_origin(origin);
+    return origin;
+}
+
+static void update_time_origin(void) {
+    uint64_t origin = 0;
+    if (!sample_time_origin(&origin)) {
+        origin = wall_ticks_now() - uptime_ticks_now();
+    }
+    store_time_origin(origin);
+}
+
+/*
+ * Re-align the bridge. force=1 is used at pause/resume/reset boundaries where
+ * the queue is already drained; force=0 is the per-frame self-heal that only
+ * fires on a genuine discontinuity (suspend, NTP step, doze without a
+ * lifecycle callback). Returns 1 when the origin actually moved, so the caller
+ * can drop in-flight events whose frozen offsetTick snapshots are now stale.
+ */
+static int async_clock_guard_time_origin(const char *reason, int force) {
+    uint64_t sampled = 0;
+    if (!sample_time_origin(&sampled)) {
+        return 0;
+    }
+
+    uint64_t cached = __atomic_load_n(&g_wall_minus_uptime_ticks, __ATOMIC_RELAXED);
+    if (cached == 0) {
+        store_time_origin(sampled);
+        return 0;
+    }
+
+    int64_t drift = (int64_t)(sampled - cached);
+    int64_t magnitude = drift < 0 ? -drift : drift;
+    if (!force && magnitude < (int64_t)CLOCK_ORIGIN_DRIFT_TOLERANCE_TICKS) {
+        return 0;
+    }
+    if (drift == 0) {
+        return 0;
+    }
+
+    store_time_origin(sampled);
+    LOGI("CLOCK_ORIGIN_RESYNC reason=%s force=%d drift_ms=%.3f old=%" PRIu64 " new=%" PRIu64,
+         reason != NULL ? reason : "unknown",
+         force,
+         (double)drift / 10000.0,
+         cached,
+         sampled);
+    return 1;
 }
 
 static uint64_t uptime_ms_to_wall_ticks(int64_t ms) {
-    if (g_wall_minus_uptime_ticks == 0) {
-        update_time_origin();
-    }
-    return g_wall_minus_uptime_ticks + (uint64_t)ms * 10000ULL;
+    return load_time_origin() + (uint64_t)ms * 10000ULL;
 }
 
 static uint64_t uptime_ns_to_wall_ticks(int64_t ns) {
-    if (g_wall_minus_uptime_ticks == 0) {
-        update_time_origin();
-    }
-    return g_wall_minus_uptime_ticks + (uint64_t)(ns / 100);
+    return load_time_origin() + (uint64_t)(ns / 100);
 }
 
 static uint64_t raw_ns_to_wall_tick(uint64_t raw_ns) {
@@ -749,13 +866,11 @@ static uint64_t raw_ns_to_wall_tick(uint64_t raw_ns) {
 }
 
 static uint64_t wall_tick_to_raw_ns(uint64_t tick) {
-    if (g_wall_minus_uptime_ticks == 0) {
-        update_time_origin();
-    }
-    if (tick <= g_wall_minus_uptime_ticks) {
+    uint64_t origin = load_time_origin();
+    if (tick <= origin) {
         return monotonic_ns_now();
     }
-    return (tick - g_wall_minus_uptime_ticks) * 100ULL;
+    return (tick - origin) * 100ULL;
 }
 
 static void virtual_clock_reset(uint64_t raw_ns) {
@@ -1196,6 +1311,9 @@ static void *input_thread_main(void *arg) {
             g_soft_pause_had_capture = 0;
             pthread_mutex_unlock(&g_lock);
             g_managed_masks_need_clear = 1;
+            /* Queue is drained and the gate is shut, so swapping the bridge here
+             * cannot re-map any in-flight event. */
+            (void)async_clock_guard_time_origin("ingress-reset", 1);
             virtual_clock_reset(record.raw_ns);
             ingress_mark_processed(record.seq);
             LOGI("runtime state cleared by ingress reset");
@@ -1203,7 +1321,15 @@ static void *input_thread_main(void *arg) {
         }
         if (record.kind == INGRESS_SOFT_PAUSE) {
             pthread_mutex_lock(&g_lock);
-            g_soft_pause_had_capture = g_capture_ready && g_last_playercontrol_wall_tick != 0;
+            /*
+             * onPause and onWindowFocusChanged(false) both post a soft pause, so
+             * this branch runs twice per screen lock. Only latch the flag; the
+             * second pass would otherwise observe the gate already shut and
+             * clear the record that capture was live before the pause.
+             */
+            if (g_capture_ready && g_last_playercontrol_wall_tick != 0) {
+                g_soft_pause_had_capture = 1;
+            }
             clear_runtime_state_locked();
             set_capture_gate_locked(0, 0);
             pthread_mutex_unlock(&g_lock);
@@ -1219,6 +1345,9 @@ static void *input_thread_main(void *arg) {
             resume_capture = g_soft_pause_had_capture;
             g_soft_pause_had_capture = 0;
             pthread_mutex_unlock(&g_lock);
+            /* The suspend that just ended is exactly where CLOCK_MONOTONIC and
+             * CLOCK_REALTIME diverged; re-align before any tick is converted. */
+            (void)async_clock_guard_time_origin("soft-resume", 1);
             if (resume_capture) {
                 virtual_clock_resume(record.raw_ns);
             } else {
@@ -1943,6 +2072,25 @@ static void ensure_async_clock_fields(uint64_t tick, int64_t fix_divider) {
     if (!g_enabled || tick == 0) {
         return;
     }
+    /*
+     * Self-heal the wall/uptime bridge before anything converts a tick this
+     * frame. This covers the suspend paths that never reach a lifecycle
+     * callback (doze), a mid-song CLOCK_REALTIME step, and the window where the
+     * main thread runs a frame before the input thread drains the unacked
+     * SOFT_RESUME command.
+     *
+     * A moved origin is a clock discontinuity, so drop the queue: every pending
+     * AsyncEvent carries an offsetTick snapshot frozen at enqueue time, and the
+     * offset is about to be hard reset, which invalidates those snapshots.
+     */
+    if (async_clock_guard_time_origin("frame", 0)) {
+        int dropped = 0;
+        pthread_mutex_lock(&g_lock);
+        dropped = queue_active_count_locked();
+        clear_runtime_state_locked();
+        pthread_mutex_unlock(&g_lock);
+        LOGW("CLOCK_ORIGIN_DRIFT recovered at frame boundary; dropped=%d pending events", dropped);
+    }
     if (fix_divider <= 0) {
         fix_divider = 1;
     }
@@ -2366,7 +2514,13 @@ static void hooked_set_paused(void *self, int value, void *method) {
 }
 
 static void set_enabled_internal(int enabled, int persist) {
-    int normalized = enabled ? 1 : 0;
+    int requested = enabled ? 1 : 0;
+    if (persist) {
+        /* Preserve the requested state even if the license gate is still starting. */
+        save_bool_file(CFG_PATH, requested);
+    }
+
+    int normalized = requested;
     int changed = (g_enabled != normalized);
     g_enabled = normalized;
     if (!normalized) {
@@ -2386,17 +2540,39 @@ static void set_enabled_internal(int enabled, int persist) {
         g_last_update_input_frame = -1;
         g_last_update_input_controller = NULL;
     }
-    if (persist) {
-        save_bool_file(CFG_PATH, normalized);
-    }
     if (changed) {
         LOGI("async input %s", normalized ? "ON" : "OFF");
     }
 }
 
+static void apply_persisted_control_state(void) {
+    pthread_mutex_lock(&g_control_lock);
+    int enabled = load_bool_file(CFG_PATH, 0);
+    int auto_replay_enabled = load_bool_file(AUTO_REPLAY_CFG_PATH, 1);
+    int trace_enabled = load_bool_file(TRACE_CFG_PATH, 0);
+    int test_macro_enabled = load_bool_file(TEST_MACRO_CFG_PATH, 0);
+
+    g_auto_replay_enabled = auto_replay_enabled;
+    g_trace_enabled = trace_enabled;
+    g_test_macro_enabled = test_macro_enabled;
+    if (!g_test_macro_enabled) {
+        pthread_mutex_lock(&g_lock);
+        reset_test_macro_target_state_locked();
+        pthread_mutex_unlock(&g_lock);
+    }
+    set_enabled_internal(enabled, 0);
+    pthread_mutex_unlock(&g_control_lock);
+
+    LOGI("async auto replay default=%d", g_auto_replay_enabled);
+    LOGI("async trace log default=%d", g_trace_enabled);
+    LOGI("async test macro default=%d", g_test_macro_enabled);
+}
+
 __attribute__((visibility("default")))
 void ADOFAIAsyncInput_SetEnabled(int enabled) {
+    pthread_mutex_lock(&g_control_lock);
     set_enabled_internal(enabled, 1);
+    pthread_mutex_unlock(&g_control_lock);
 }
 
 __attribute__((visibility("default")))
@@ -2406,9 +2582,12 @@ int ADOFAIAsyncInput_IsEnabled(void) {
 
 __attribute__((visibility("default")))
 void ADOFAIAsyncInput_SetAutoReplayEnabled(int enabled) {
-    g_auto_replay_enabled = enabled ? 1 : 0;
-    save_bool_file(AUTO_REPLAY_CFG_PATH, g_auto_replay_enabled);
+    pthread_mutex_lock(&g_control_lock);
+    int normalized = enabled ? 1 : 0;
+    save_bool_file(AUTO_REPLAY_CFG_PATH, normalized);
+    g_auto_replay_enabled = normalized;
     LOGI("async auto replay %s", g_auto_replay_enabled ? "ON" : "OFF");
+    pthread_mutex_unlock(&g_control_lock);
 }
 
 __attribute__((visibility("default")))
@@ -2418,9 +2597,12 @@ int ADOFAIAsyncInput_IsAutoReplayEnabled(void) {
 
 __attribute__((visibility("default")))
 void ADOFAIAsyncInput_SetTraceEnabled(int enabled) {
-    g_trace_enabled = enabled ? 1 : 0;
-    save_bool_file(TRACE_CFG_PATH, g_trace_enabled);
+    pthread_mutex_lock(&g_control_lock);
+    int normalized = enabled ? 1 : 0;
+    save_bool_file(TRACE_CFG_PATH, normalized);
+    g_trace_enabled = normalized;
     LOGI("async trace log %s", g_trace_enabled ? "ON" : "OFF");
+    pthread_mutex_unlock(&g_control_lock);
 }
 
 __attribute__((visibility("default")))
@@ -2430,19 +2612,47 @@ int ADOFAIAsyncInput_IsTraceEnabled(void) {
 
 __attribute__((visibility("default")))
 void ADOFAIAsyncInput_SetTestMacroEnabled(int enabled) {
-    g_test_macro_enabled = enabled ? 1 : 0;
+    pthread_mutex_lock(&g_control_lock);
+    int normalized = enabled ? 1 : 0;
+    save_bool_file(TEST_MACRO_CFG_PATH, normalized);
+    g_test_macro_enabled = normalized;
     if (!g_test_macro_enabled) {
         pthread_mutex_lock(&g_lock);
         reset_test_macro_target_state_locked();
         pthread_mutex_unlock(&g_lock);
     }
-    save_bool_file(TEST_MACRO_CFG_PATH, g_test_macro_enabled);
     LOGI("async test macro %s", g_test_macro_enabled ? "ON" : "OFF");
+    pthread_mutex_unlock(&g_control_lock);
 }
 
 __attribute__((visibility("default")))
 int ADOFAIAsyncInput_IsTestMacroEnabled(void) {
     return g_test_macro_enabled ? 1 : 0;
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_fizzd_connectedworlds_editorport_ExtraMenuUnityPlayerActivity_nativeApplyAsyncInputControl(
+    JNIEnv *env, jclass clazz, jint control, jboolean enabled) {
+    (void)env;
+    (void)clazz;
+    int value = enabled == JNI_TRUE ? 1 : 0;
+    switch (control) {
+        case ASYNC_CONTROL_ENABLED:
+            ADOFAIAsyncInput_SetEnabled(value);
+            return JNI_TRUE;
+        case ASYNC_CONTROL_AUTO_REPLAY:
+            ADOFAIAsyncInput_SetAutoReplayEnabled(value);
+            return JNI_TRUE;
+        case ASYNC_CONTROL_TRACE:
+            ADOFAIAsyncInput_SetTraceEnabled(value);
+            return JNI_TRUE;
+        case ASYNC_CONTROL_TEST_MACRO:
+            ADOFAIAsyncInput_SetTestMacroEnabled(value);
+            return JNI_TRUE;
+        default:
+            LOGW("unknown async control=%d", (int)control);
+            return JNI_FALSE;
+    }
 }
 
 static int is_special_key(int key_code, int meta_state) {
@@ -2482,15 +2692,19 @@ static void init_input_api_once(void) {
     g_key_event_get_time = (InputEventGetTimeFn)dlsym(libandroid, "AKeyEvent_getEventTime");
     g_input_event_release = (InputEventReleaseFn)dlsym(libandroid, "AInputEvent_release");
     g_input_event_get_source = (InputEventGetSourceFn)dlsym(libandroid, "AInputEvent_getSource");
+    g_input_event_get_device_id = (InputEventGetIntFn)dlsym(libandroid, "AInputEvent_getDeviceId");
     g_motion_event_get_action = (MotionEventGetActionFn)dlsym(libandroid, "AMotionEvent_getAction");
     g_motion_event_get_pointer_count = (MotionEventGetPointerCountFn)dlsym(libandroid, "AMotionEvent_getPointerCount");
     g_motion_event_get_pointer_id = (MotionEventGetPointerIdFn)dlsym(libandroid, "AMotionEvent_getPointerId");
     g_motion_event_get_x = (MotionEventGetCoordFn)dlsym(libandroid, "AMotionEvent_getX");
     g_motion_event_get_y = (MotionEventGetCoordFn)dlsym(libandroid, "AMotionEvent_getY");
+    g_motion_event_get_flags = (InputEventGetIntFn)dlsym(libandroid, "AMotionEvent_getFlags");
     g_key_event_get_action = (KeyEventGetIntFn)dlsym(libandroid, "AKeyEvent_getAction");
     g_key_event_get_key_code = (KeyEventGetIntFn)dlsym(libandroid, "AKeyEvent_getKeyCode");
+    g_key_event_get_scan_code = (KeyEventGetIntFn)dlsym(libandroid, "AKeyEvent_getScanCode");
     g_key_event_get_meta_state = (KeyEventGetIntFn)dlsym(libandroid, "AKeyEvent_getMetaState");
     g_key_event_get_repeat_count = (KeyEventGetIntFn)dlsym(libandroid, "AKeyEvent_getRepeatCount");
+    g_key_event_get_flags = (KeyEventGetIntFn)dlsym(libandroid, "AKeyEvent_getFlags");
 
     if (g_motion_event_from_java != NULL && g_key_event_from_java != NULL &&
         g_motion_event_get_time != NULL && g_key_event_get_time != NULL &&
@@ -2533,7 +2747,10 @@ static int ensure_motion_methods(JNIEnv *env, jobject event) {
     g_motion_methods.getActionMasked = safe_get_method(env, cls, "getActionMasked", "()I");
     g_motion_methods.getActionIndex = safe_get_method(env, cls, "getActionIndex", "()I");
     g_motion_methods.getPointerId = safe_get_method(env, cls, "getPointerId", "(I)I");
+    g_motion_methods.getPointerCount = safe_get_method(env, cls, "getPointerCount", "()I");
     g_motion_methods.getSource = safe_get_method(env, cls, "getSource", "()I");
+    g_motion_methods.getDeviceId = safe_get_method(env, cls, "getDeviceId", "()I");
+    g_motion_methods.getFlags = safe_get_method(env, cls, "getFlags", "()I");
     g_motion_methods.getX = safe_get_method(env, cls, "getX", "(I)F");
     g_motion_methods.getY = safe_get_method(env, cls, "getY", "(I)F");
 
@@ -2582,8 +2799,12 @@ static int ensure_key_methods(JNIEnv *env, jobject event) {
 
     g_key_methods.getAction = safe_get_method(env, cls, "getAction", "()I");
     g_key_methods.getKeyCode = safe_get_method(env, cls, "getKeyCode", "()I");
+    g_key_methods.getScanCode = safe_get_method(env, cls, "getScanCode", "()I");
     g_key_methods.getMetaState = safe_get_method(env, cls, "getMetaState", "()I");
+    g_key_methods.getDeviceId = safe_get_method(env, cls, "getDeviceId", "()I");
     g_key_methods.getRepeatCount = safe_get_method(env, cls, "getRepeatCount", "()I");
+    g_key_methods.getSource = safe_get_method(env, cls, "getSource", "()I");
+    g_key_methods.getFlags = safe_get_method(env, cls, "getFlags", "()I");
 
     if (g_key_methods.getAction == NULL || g_key_methods.getKeyCode == NULL) {
         (*env)->DeleteLocalRef(env, cls);
@@ -2733,8 +2954,9 @@ static int native_motion_snapshot(JNIEnv *env, jobject event, MotionEventSnapsho
 
     int packed_action = g_motion_event_get_action(native_event);
     int index = (packed_action >> 8) & 0xff;
+    size_t pointer_count = 1;
     if (g_motion_event_get_pointer_count != NULL) {
-        size_t pointer_count = g_motion_event_get_pointer_count(native_event);
+        pointer_count = g_motion_event_get_pointer_count(native_event);
         if (index < 0 || (size_t)index >= pointer_count) {
             g_input_event_release(native_event);
             return 0;
@@ -2744,7 +2966,10 @@ static int native_motion_snapshot(JNIEnv *env, jobject event, MotionEventSnapsho
     out->action = packed_action & ACTION_MASK;
     out->index = index;
     out->pointer_id = g_motion_event_get_pointer_id(native_event, (size_t)index);
+    out->pointer_count = pointer_count > INT32_MAX ? INT32_MAX : (int)pointer_count;
     out->source = g_input_event_get_source ? g_input_event_get_source(native_event) : SOURCE_TOUCHSCREEN;
+    out->device_id = g_input_event_get_device_id ? g_input_event_get_device_id(native_event) : 0;
+    out->android_flags = g_motion_event_get_flags ? g_motion_event_get_flags(native_event) : 0;
     if (g_motion_event_get_x != NULL && g_motion_event_get_y != NULL) {
         out->x = g_motion_event_get_x(native_event, (size_t)index);
         out->y = g_motion_event_get_y(native_event, (size_t)index);
@@ -2778,8 +3003,12 @@ static int native_key_snapshot(JNIEnv *env, jobject event, KeyEventSnapshot *out
 
     out->action = g_key_event_get_action(native_event);
     out->key_code = g_key_event_get_key_code(native_event);
+    out->scan_code = g_key_event_get_scan_code ? g_key_event_get_scan_code(native_event) : 0;
     out->meta_state = g_key_event_get_meta_state ? g_key_event_get_meta_state(native_event) : 0;
+    out->device_id = g_input_event_get_device_id ? g_input_event_get_device_id(native_event) : 0;
     out->repeat_count = g_key_event_get_repeat_count ? g_key_event_get_repeat_count(native_event) : 0;
+    out->source = g_input_event_get_source ? g_input_event_get_source(native_event) : SOURCE_KEYBOARD;
+    out->android_flags = g_key_event_get_flags ? g_key_event_get_flags(native_event) : 0;
     out->raw_ns = (uint64_t)g_key_event_get_time(native_event);
     g_input_event_release(native_event);
     return 1;
@@ -2898,9 +3127,6 @@ Java_com_fizzd_connectedworlds_editorport_ExtraMenuUnityPlayerActivity_nativeOnT
         return JNI_FALSE;
     }
     ensure_input_thread_started();
-    if (controller_pause_releases_input_cached()) {
-        return JNI_FALSE;
-    }
 
     MotionEventSnapshot native_event;
     int native_ok = native_motion_snapshot(env, event, &native_event);
@@ -2909,6 +3135,9 @@ Java_com_fizzd_connectedworlds_editorport_ExtraMenuUnityPlayerActivity_nativeOnT
     int pointer_id = 0;
     int source = SOURCE_TOUCHSCREEN;
     uint64_t raw_ns = 0;
+    float x = 0.0f;
+    float y = 0.0f;
+    int has_xy = 0;
 
     if (native_ok) {
         action = native_event.action;
@@ -2916,6 +3145,9 @@ Java_com_fizzd_connectedworlds_editorport_ExtraMenuUnityPlayerActivity_nativeOnT
         pointer_id = native_event.pointer_id;
         source = native_event.source;
         raw_ns = native_event.raw_ns;
+        x = native_event.x;
+        y = native_event.y;
+        has_xy = native_event.has_xy;
     } else {
         if (!ensure_motion_methods(env, event)) {
             return JNI_FALSE;
@@ -2924,31 +3156,26 @@ Java_com_fizzd_connectedworlds_editorport_ExtraMenuUnityPlayerActivity_nativeOnT
         index = (*env)->CallIntMethod(env, event, g_motion_methods.getActionIndex);
         pointer_id = (*env)->CallIntMethod(env, event, g_motion_methods.getPointerId, index);
         source = g_motion_methods.getSource ? (*env)->CallIntMethod(env, event, g_motion_methods.getSource) : SOURCE_TOUCHSCREEN;
+        if (g_motion_methods.getX != NULL && g_motion_methods.getY != NULL) {
+            x = (*env)->CallFloatMethod(env, event, g_motion_methods.getX, index);
+            y = (*env)->CallFloatMethod(env, event, g_motion_methods.getY, index);
+            has_xy = 1;
+        }
         if ((*env)->ExceptionCheck(env)) {
             (*env)->ExceptionClear(env);
             return JNI_FALSE;
         }
+        raw_ns = java_event_time_ns(env, event);
     }
+
+    if (controller_pause_releases_input_cached()) {
+        return JNI_FALSE;
+    }
+
     int source_id = (source << 16) ^ (pointer_id & 0xffff);
     int was_suppressed = 0;
 
     if (action == ACTION_DOWN || action == ACTION_POINTER_DOWN) {
-        float x = 0.0f;
-        float y = 0.0f;
-        int has_xy = 0;
-        if (native_ok && native_event.has_xy) {
-            x = native_event.x;
-            y = native_event.y;
-            has_xy = 1;
-        } else if (!native_ok && g_motion_methods.getX != NULL && g_motion_methods.getY != NULL) {
-            x = (*env)->CallFloatMethod(env, event, g_motion_methods.getX, index);
-            y = (*env)->CallFloatMethod(env, event, g_motion_methods.getY, index);
-            if ((*env)->ExceptionCheck(env)) {
-                (*env)->ExceptionClear(env);
-                return JNI_FALSE;
-            }
-            has_xy = 1;
-        }
         if (has_xy) {
             if (is_mobile_ui_touch(x, y, (int)view_width, (int)view_height)) {
                 add_ui_source(source_id);
@@ -2993,9 +3220,6 @@ Java_com_fizzd_connectedworlds_editorport_ExtraMenuUnityPlayerActivity_nativeOnT
         return was_suppressed ? JNI_TRUE : JNI_FALSE;
     }
 
-    if (!native_ok) {
-        raw_ns = java_event_time_ns(env, event);
-    }
     if (!capture_accepts_raw_ns(raw_ns)) {
         return JNI_FALSE;
     }
@@ -3023,9 +3247,6 @@ Java_com_fizzd_connectedworlds_editorport_ExtraMenuUnityPlayerActivity_nativeOnK
         return JNI_FALSE;
     }
     ensure_input_thread_started();
-    if (controller_pause_releases_input_cached()) {
-        return JNI_FALSE;
-    }
 
     KeyEventSnapshot native_event;
     int native_ok = native_key_snapshot(env, event, &native_event);
@@ -3053,7 +3274,13 @@ Java_com_fizzd_connectedworlds_editorport_ExtraMenuUnityPlayerActivity_nativeOnK
             (*env)->ExceptionClear(env);
             return JNI_FALSE;
         }
+        raw_ns = java_event_time_ns(env, event);
     }
+
+    if (controller_pause_releases_input_cached()) {
+        return JNI_FALSE;
+    }
+
     if (!should_accept_key(key_code, meta_state, repeat_count)) {
         return JNI_FALSE;
     }
@@ -3068,9 +3295,6 @@ Java_com_fizzd_connectedworlds_editorport_ExtraMenuUnityPlayerActivity_nativeOnK
         return JNI_FALSE;
     }
 
-    if (!native_ok) {
-        raw_ns = java_event_time_ns(env, event);
-    }
     if (!capture_accepts_raw_ns(raw_ns)) {
         return JNI_FALSE;
     }
@@ -3193,12 +3417,12 @@ static int hooked_async_is_active(void *method) {
     return active;
 }
 
-static int async_query_active(void) {
+static inline int async_query_active(void) {
     return g_enabled && g_in_async_replay &&
            g_replay_mode == REPLAY_MODE_LEGACY;
 }
 
-static int mask_replay_active(void) {
+static inline int mask_replay_active(void) {
     return g_enabled && g_in_async_replay &&
            g_replay_mode == REPLAY_MODE_MASK;
 }
@@ -3553,6 +3777,9 @@ static int hooked_scrplayer_hit(void *self, int is_auto, void *method) {
         __atomic_load_n(&g_current_replay_is_synthetic_auto, __ATOMIC_ACQUIRE)) {
         return 0;
     }
+    if (ADO_LIKELY(!g_trace_enabled)) {
+        return g_original_scrplayer_hit(self, is_auto, method);
+    }
     trace_judgement_state("Hit.before", self, is_auto, -1);
     int result = g_original_scrplayer_hit(self, is_auto, method);
     trace_judgement_state("Hit.after", self, is_auto, result);
@@ -3700,40 +3927,57 @@ static int force_adjust_angle_from_tick(void *player, uint64_t target_tick, int 
 }
 
 static void hooked_adjust_angle(void *player, uint64_t target_tick, void *method) {
-    trace_judgement_state("AdjustAngle.before", player, 0, -1);
+    if (ADO_UNLIKELY(g_trace_enabled)) {
+        trace_judgement_state("AdjustAngle.before", player, 0, -1);
+    }
     if (g_original_adjust_angle != NULL) {
         g_original_adjust_angle(player, target_tick, method);
     }
-    uint64_t replay_tick = __atomic_load_n(&g_current_replay_tick, __ATOMIC_ACQUIRE);
-    if (replay_tick != 0 && target_tick == replay_tick) {
-        (void)force_adjust_angle_from_tick(player, target_tick, 0);
+    if (ADO_UNLIKELY(g_in_async_replay && g_replay_mode == REPLAY_MODE_MASK)) {
+        uint64_t replay_tick = __atomic_load_n(&g_current_replay_tick, __ATOMIC_ACQUIRE);
+        if (replay_tick != 0 && target_tick == replay_tick) {
+            (void)force_adjust_angle_from_tick(player, target_tick, 0);
+        }
     }
-    trace_judgement_state("AdjustAngle.after", player, 0, -1);
+    if (ADO_UNLIKELY(g_trace_enabled)) {
+        trace_judgement_state("AdjustAngle.after", player, 0, -1);
+    }
 }
 
 static void *hooked_scrplanet_switch_chosen(void *self, void *method) {
+    int replay_projection_active = g_in_async_replay && g_replay_mode == REPLAY_MODE_MASK;
+    if (ADO_LIKELY(!g_trace_enabled && !replay_projection_active)) {
+        return g_original_scrplanet_switch_chosen(self, method);
+    }
+
     void *player = NULL;
     (void)read_instance_object_field(self, g_offset_scrplanet_player, &player);
     uint64_t replay_tick = __atomic_load_n(&g_current_replay_tick, __ATOMIC_ACQUIRE);
-    if (g_in_async_replay && g_replay_mode == REPLAY_MODE_MASK && replay_tick != 0 && player != NULL) {
+    if (replay_projection_active && replay_tick != 0 && player != NULL) {
         (void)project_planet_angle_from_tick(player, self, replay_tick, 0);
     }
-    trace_judgement_state("SwitchChosen.before", player, 0, -1);
+    if (ADO_UNLIKELY(g_trace_enabled)) {
+        trace_judgement_state("SwitchChosen.before", player, 0, -1);
+    }
     void *result = g_original_scrplanet_switch_chosen(self, method);
-    if (g_in_async_replay && g_replay_mode == REPLAY_MODE_MASK && replay_tick != 0 && player != NULL) {
+    if (replay_projection_active && replay_tick != 0 && player != NULL) {
         uint64_t frame_tick = current_async_frame_tick_or_now();
         (void)project_planet_angle_from_tick(player, result != NULL ? result : self, frame_tick, 1);
     }
-    trace_judgement_state("SwitchChosen.after", player, 0, result != self ? 1 : 0);
+    if (ADO_UNLIKELY(g_trace_enabled)) {
+        trace_judgement_state("SwitchChosen.after", player, 0, result != self ? 1 : 0);
+    }
     return result;
 }
 
 static void hooked_camera_update_follow_cam(void *self, int force, void *method) {
-    uint64_t replay_tick = __atomic_load_n(&g_current_replay_tick, __ATOMIC_ACQUIRE);
-    if (g_enabled && g_in_async_replay && g_replay_mode == REPLAY_MODE_MASK && replay_tick != 0) {
-        void *controller_self = g_current_controller_self != NULL ? g_current_controller_self : read_adobase_controller();
-        uint64_t frame_tick = current_async_frame_tick_or_now();
-        restore_async_angle_to_tick(controller_self, frame_tick);
+    if (ADO_UNLIKELY(g_enabled && g_in_async_replay && g_replay_mode == REPLAY_MODE_MASK)) {
+        uint64_t replay_tick = __atomic_load_n(&g_current_replay_tick, __ATOMIC_ACQUIRE);
+        if (replay_tick != 0) {
+            void *controller_self = g_current_controller_self != NULL ? g_current_controller_self : read_adobase_controller();
+            uint64_t frame_tick = current_async_frame_tick_or_now();
+            restore_async_angle_to_tick(controller_self, frame_tick);
+        }
     }
     if (g_original_camera_update_follow_cam != NULL) {
         g_original_camera_update_follow_cam(self, force, method);
@@ -4741,15 +4985,15 @@ static void hooked_update_input(void *self, void *method) {
         return;
     }
 
-    {
+    if (ADO_UNLIKELY(g_trace_enabled)) {
         static uint64_t g_hook_entry_count = 0;
         static uint64_t g_last_hook_count_log_ns = 0;
         uint64_t entries = __atomic_add_fetch(&g_hook_entry_count, 1, __ATOMIC_RELAXED);
         uint64_t now_count_ns = monotonic_ns_now();
-        if (g_trace_enabled && g_last_hook_count_log_ns == 0) {
+        if (g_last_hook_count_log_ns == 0) {
             g_last_hook_count_log_ns = now_count_ns;
         }
-        if (g_trace_enabled && now_count_ns - g_last_hook_count_log_ns >= 1000000000ULL) {
+        if (now_count_ns - g_last_hook_count_log_ns >= 1000000000ULL) {
             uint64_t prev_entries_ns = g_last_hook_count_log_ns;
             g_last_hook_count_log_ns = now_count_ns;
             static uint64_t g_last_hook_entries = 0;
@@ -4806,18 +5050,21 @@ static void hooked_update_input(void *self, void *method) {
     uint64_t target_tick = wall_tick_now_or_virtual();
     ensure_async_clock_fields(target_tick, 100);
 
-    uint64_t now_ns = monotonic_ns_now();
-    if (g_trace_enabled && now_ns - g_last_update_input_log_ns >= 1000000000ULL) {
-        g_last_update_input_log_ns = now_ns;
-        LOGI("UpdateInput async replay state=%d target=%" PRIu64 " queue_posted=%" PRIu64 " sealed=%" PRIu64 " replayed=%" PRIu64,
-             controller_current_state(self),
-             target_tick,
-             g_ingress_event_posted_count,
-             g_ingress_event_sealed_count,
-             g_replay_event_count);
+    if (ADO_UNLIKELY(g_trace_enabled)) {
+        uint64_t now_ns = monotonic_ns_now();
+        if (now_ns - g_last_update_input_log_ns >= 1000000000ULL) {
+            g_last_update_input_log_ns = now_ns;
+            LOGI("UpdateInput async replay state=%d target=%" PRIu64 " queue_posted=%" PRIu64 " sealed=%" PRIu64 " replayed=%" PRIu64,
+                 controller_current_state(self),
+                 target_tick,
+                 g_ingress_event_posted_count,
+                 g_ingress_event_sealed_count,
+                 g_replay_event_count);
+        }
     }
 
     if (!ensure_mask_api_ready()) {
+        uint64_t now_ns = monotonic_ns_now();
         if (now_ns - g_last_legacy_fallback_log_ns >= 1000000000ULL) {
             g_last_legacy_fallback_log_ns = now_ns;
             LOGW("mask API unavailable, using legacy replay fallback for this frame");
@@ -4836,16 +5083,18 @@ static void hooked_update_input(void *self, void *method) {
     async_masks_clear_frame_edges();
 
     int replayed = replay_pending_events_via_process_key_inputs(self, target_tick, REPLAY_MODE_MASK);
-    int pending_after_replay = 0;
-    pthread_mutex_lock(&g_lock);
-    pending_after_replay = queue_active_count_locked();
-    pthread_mutex_unlock(&g_lock);
-    if (replayed == 0 && pending_after_replay > 0) {
-        uint64_t now_wait_ns = monotonic_ns_now();
-        if (g_trace_enabled && now_wait_ns - g_last_replay_empty_log_ns >= 500000000ULL) {
-            g_last_replay_empty_log_ns = now_wait_ns;
-            LOGI("no due async event this frame; ProcessKeyInputs skipped target=%" PRIu64,
-                 target_tick);
+    if (ADO_UNLIKELY(g_trace_enabled && replayed == 0)) {
+        int pending_after_replay = 0;
+        pthread_mutex_lock(&g_lock);
+        pending_after_replay = queue_active_count_locked();
+        pthread_mutex_unlock(&g_lock);
+        if (pending_after_replay > 0) {
+            uint64_t now_wait_ns = monotonic_ns_now();
+            if (now_wait_ns - g_last_replay_empty_log_ns >= 500000000ULL) {
+                g_last_replay_empty_log_ns = now_wait_ns;
+                LOGI("no due async event this frame; ProcessKeyInputs skipped target=%" PRIu64,
+                     target_tick);
+            }
         }
     }
 
@@ -6636,13 +6885,7 @@ static void *patch_thread_main(void *arg) {
         LOGI("libil2cpp.so found base=0x%lx", (unsigned long)base);
         install_il2cpp_state_hooks();
         update_time_origin();
-        set_enabled_internal(load_bool_file(CFG_PATH, 0), 0);
-        g_auto_replay_enabled = load_bool_file(AUTO_REPLAY_CFG_PATH, 1);
-        g_trace_enabled = load_bool_file(TRACE_CFG_PATH, 0);
-        g_test_macro_enabled = load_bool_file(TEST_MACRO_CFG_PATH, 0);
-        LOGI("async auto replay default=%d", g_auto_replay_enabled);
-        LOGI("async trace log default=%d", g_trace_enabled);
-        LOGI("async test macro default=%d", g_test_macro_enabled);
+        apply_persisted_control_state();
 
         reset_metadata_state();
         g_offset_scrcontroller_current_state = OFFSET_SCRCONTROLLER_CURRENT_STATE;
@@ -6712,9 +6955,9 @@ static void *patch_thread_main(void *arg) {
 }
 
 JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *reserved) {
-    (void)vm;
     (void)reserved;
     LOGI("JNI_OnLoad entered");
+    (void)vm;
 
     pthread_t thread;
     int rc = pthread_create(&thread, NULL, patch_thread_main, NULL);

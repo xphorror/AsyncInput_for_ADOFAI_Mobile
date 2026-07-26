@@ -61,6 +61,26 @@ offsetTick = asyncNowTick - dspTime * 10000000
 
 当前实现按 PC-like 方式维护 `offsetTick`：`fixDivider <= 1` 或 session hard reset 时直接对齐，其余帧按 `delta / fixDivider` 平滑更新。这样避免每帧硬覆盖导致的时间桥抖动，也避免 gameplay 判定 tick 被 lifecycle soft pause 的虚拟时钟基准影响。
 
+### 换算原点必须持续对齐
+
+事件 tick 和帧 tick 来自两个不同的系统时钟，靠一个缓存原点桥接：
+
+| 量 | 时钟源 |
+|---|---|
+| 帧 tick（`currFrameTick` / `offsetTick`） | `CLOCK_REALTIME` |
+| 事件 tick（Android 输入事件时间戳） | `CLOCK_MONOTONIC`，经 `wall - uptime` 原点换算 |
+
+Android 上 `CLOCK_MONOTONIC` 在系统 suspend 期间停走，而 `CLOCK_REALTIME` 继续走。因此**每次设备挂起都会让这个原点失效，失效量恰好等于挂起时长**。原点若只在启动时算一次，锁屏再解锁后 `eventTick` 会整体落后，`eventTick - offsetTick` 进入错误 song time，`AdjustAngle` 把行星角度投影回挂起前，判定严重错乱。
+
+保持两者同域不是一次性初始化，而是持续义务。实现为两级：
+
+1. **边界强制重同步** — 输入线程处理 lifecycle reset 与 soft resume 时重新采样原点。此刻队列已清、capture gate 已关，换原点不会误换算在飞事件。
+2. **每帧漂移自愈** — 主线程每帧比对原点，漂移超 20 ms 才触发。覆盖不经生命周期回调的 doze、歌曲中途的 `CLOCK_REALTIME` 阶跃，以及 soft resume 命令不等 ack 时主线程抢先跑一帧的窗口。
+
+原点采样用 `uptime -> wall -> uptime` 三明治，两次 uptime 间隔过大判为被抢占并丢弃该次采样，避免调度延迟被误判成真实漂移。
+
+原点一旦移动即视为时钟不连续，会清空事件队列并强制 `offsetTick` hard reset —— 队列里每个事件携带的是入队时冻结的旧 `offsetTick` 快照，跨越不连续后不再可用。日志关键字为 `CLOCK_ORIGIN_RESYNC` 和 `CLOCK_ORIGIN_DRIFT`。
+
 官方 `scrPlanet.SwitchChosen()` 的命中判定读取 `cachedAngle`。mask replay 在调用官方判定前会把 `angle` 和 `cachedAngle` 同时投影到当前 `eventTick`，保证 `GetHitMargin(cachedAngle, targetExitAngle, ...)` 看到的是同一个目标时间点。
 
 ## 输入 gate
@@ -95,7 +115,9 @@ gate 关闭时：
 
 Java callback 只负责把 raw event 转交 native。native ingress thread 串行处理输入事件、reset、soft pause 和 soft resume。
 
-进入新 gameplay capture 时会清理旧队列并重建虚拟时钟基准；soft pause/resume 只在暂停前确实处于 gameplay capture 时复用冻结时钟。
+进入新 gameplay capture 时会清理旧队列并重建虚拟时钟基准；soft pause/resume 只在暂停前确实处于 gameplay capture 时复用冻结时钟。注意 `onPause` 与 `onWindowFocusChanged(false)` 通常会连发两次 soft pause，"暂停前是否在 capture"的标记因此只置位、不被第二次覆写，清零交给 soft resume 和 reset。
+
+soft resume 还会强制重同步时间换算原点，详见「时间域 / 换算原点必须持续对齐」。
 
 capture gate 有 stale timeout。如果 `PlayerControl_Update` 不再刷新 gate，native 会关闭 capture、清队列并恢复 regular input type，避免继续吞正常输入。
 

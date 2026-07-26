@@ -14,6 +14,7 @@
 - 主 hook 点是 `scrController.PlayerControl_Update`，不会 inline hook Android IL2CPP 中 4 字节 `ret` stub 的 `scrController.UpdateInput`。
 - 多指和 multitap 使用稳定 async key slot，不再把所有物理输入折叠为单个 Space。
 - 暂停菜单/非 gameplay 状态会关闭 capture 并放行原始触摸，避免 async 管线吞掉 UI 事件。
+- 锁屏/解锁等设备挂起会让 `CLOCK_MONOTONIC` 与 `CLOCK_REALTIME` 分叉，事件 tick 与帧 tick 的换算原点因此在 lifecycle 边界强制重同步，并由每帧漂移检测兜底，避免解锁后出现与挂起时长等量的判定偏移。
 - `official_judgement.c` 保留为 trace/audit model，用于对照官方公式和状态推进，不是默认运行时判定接管方案。
 - AUTO/oldAuto 路径保留为 debug/test path，用于回归测试 async 状态机链路。
 - 内置异步测试宏可用于压测 `eventTick -> mask -> ProcessKeyInputs` 链路。测试宏启用且处于播放态时会屏蔽玩家 gameplay 输入，避免人工触摸污染基准样本。
