@@ -85,6 +85,21 @@ if ($LASTEXITCODE -ne 0) {
 }
 Write-Host "[built] $out"
 
+$readelf = Join-Path $toolchain "llvm-readelf.exe"
+if (!(Test-Path -LiteralPath $readelf)) {
+    throw "llvm-readelf not found under: $toolchain"
+}
+$dynamicSymbols = (& $readelf --dyn-syms --wide $out) -join "`n"
+foreach ($requiredExport in @(
+    "ADOFAIAsyncInput_RegisterRawObserverV1",
+    "ADOFAIAsyncInputGetIl2CppHandleV1"
+)) {
+    if ($dynamicSymbols -notmatch "(?m)\b$([regex]::Escape($requiredExport))$") {
+        throw "required dynamic export missing: $requiredExport"
+    }
+    Write-Host "[export] $requiredExport"
+}
+
 if ($CompileJavaExample) {
     if ($AndroidJar -eq "" -or !(Test-Path -LiteralPath $AndroidJar)) {
         throw "-AndroidJar is required when -CompileJavaExample is set."

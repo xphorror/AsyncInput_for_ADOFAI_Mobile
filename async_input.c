@@ -3,6 +3,7 @@
 #include <dlfcn.h>
 #include <errno.h>
 #include <elf.h>
+#include <fcntl.h>
 #include <inttypes.h>
 #include <link.h>
 #include <math.h>
@@ -11,9 +12,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
+#include "async_input_observer_abi.h"
 #include "dobby.h"
 
 #define LOG_TAG "ADOFAI_ASYNC_INPUT"
@@ -29,6 +32,11 @@
 #define AUTO_REPLAY_CFG_PATH "/data/data/" PACKAGE_NAME "/files/adofai_async_auto_replay.cfg"
 #define TRACE_CFG_PATH "/data/data/" PACKAGE_NAME "/files/adofai_async_trace.cfg"
 #define TEST_MACRO_CFG_PATH "/data/data/" PACKAGE_NAME "/files/adofai_async_test_macro.cfg"
+#define IL2CPP_HANDLE_PROVIDER_DIR "/data/data/" PACKAGE_NAME "/files"
+#define IL2CPP_HANDLE_PROVIDER_PTR_PATH \
+    IL2CPP_HANDLE_PROVIDER_DIR "/adofai_async_il2cpp_handle_provider.ptr"
+#define IL2CPP_HANDLE_PROVIDER_PTR_TMP_PATH \
+    IL2CPP_HANDLE_PROVIDER_DIR "/adofai_async_il2cpp_handle_provider.ptr.tmp"
 
 #define OFFSET_SCRCONTROLLER_CURRENT_STATE 0xD8u
 #define OFFSET_SCRCONTROLLER_PAUSED 0x1E8u
@@ -391,6 +399,9 @@ typedef struct IngressRecord {
 } IngressRecord;
 
 static Il2CppApi g_il2cpp_api;
+static uint64_t g_raw_observer_producer_epoch = 1;
+static pthread_mutex_t g_raw_observer_lock = PTHREAD_MUTEX_INITIALIZER;
+static AdoAsyncRawObserverV1 g_raw_observer;
 static volatile int g_enabled = 0;
 static volatile int g_auto_replay_enabled = 1;
 static volatile int g_trace_enabled = 0;
@@ -2513,10 +2524,33 @@ static void hooked_set_paused(void *self, int value, void *method) {
     cache_controller_paused_state(paused);
 }
 
+static AdoAsyncRawObserverV1 raw_observer_snapshot(uint64_t *producer_epoch) {
+    AdoAsyncRawObserverV1 observer;
+    pthread_mutex_lock(&g_raw_observer_lock);
+    observer = g_raw_observer;
+    if (producer_epoch != NULL) {
+        *producer_epoch = g_raw_observer_producer_epoch;
+    }
+    pthread_mutex_unlock(&g_raw_observer_lock);
+    return observer;
+}
+
+static void notify_raw_observer_enabled_changed(int enabled) {
+    AdoAsyncRawObserverV1 observer;
+    uint64_t producer_epoch;
+    pthread_mutex_lock(&g_raw_observer_lock);
+    producer_epoch = ++g_raw_observer_producer_epoch;
+    observer = g_raw_observer;
+    pthread_mutex_unlock(&g_raw_observer_lock);
+    if (observer.on_enabled_changed != NULL) {
+        observer.on_enabled_changed(observer.user_data, enabled ? 1 : 0, producer_epoch);
+    }
+}
+
 static void set_enabled_internal(int enabled, int persist) {
     int requested = enabled ? 1 : 0;
     if (persist) {
-        /* Preserve the requested state even if the license gate is still starting. */
+        /* Preserve the requested state while the runtime bridge is starting. */
         save_bool_file(CFG_PATH, requested);
     }
 
@@ -2542,6 +2576,7 @@ static void set_enabled_internal(int enabled, int persist) {
     }
     if (changed) {
         LOGI("async input %s", normalized ? "ON" : "OFF");
+        notify_raw_observer_enabled_changed(normalized);
     }
 }
 
@@ -2566,6 +2601,30 @@ static void apply_persisted_control_state(void) {
     LOGI("async auto replay default=%d", g_auto_replay_enabled);
     LOGI("async trace log default=%d", g_trace_enabled);
     LOGI("async test macro default=%d", g_test_macro_enabled);
+}
+
+__attribute__((visibility("default")))
+int ADOFAIAsyncInput_RegisterRawObserverV1(const AdoAsyncRawObserverV1 *observer) {
+    AdoAsyncRawObserverV1 next;
+    memset(&next, 0, sizeof(next));
+    if (observer != NULL) {
+        if (observer->struct_size != sizeof(AdoAsyncRawObserverV1) ||
+            observer->abi_version != ADOFAI_ASYNC_RAW_OBSERVER_ABI_V1) {
+            return 0;
+        }
+        next = *observer;
+    }
+
+    pthread_mutex_lock(&g_raw_observer_lock);
+    g_raw_observer = next;
+    uint64_t producer_epoch = g_raw_observer_producer_epoch;
+    int enabled = g_enabled ? 1 : 0;
+    pthread_mutex_unlock(&g_raw_observer_lock);
+
+    if (next.on_enabled_changed != NULL) {
+        next.on_enabled_changed(next.user_data, enabled, producer_epoch);
+    }
+    return 1;
 }
 
 __attribute__((visibility("default")))
@@ -3120,6 +3179,80 @@ static int test_macro_blocks_player_input(void) {
     return g_test_macro_enabled && capture_gate_open() && async_is_active_gate_allows();
 }
 
+static void publish_raw_touch_observer(int action,
+                                       int pointer_id,
+                                       int pointer_count,
+                                       int source,
+                                       int device_id,
+                                       uint64_t raw_ns,
+                                       float x,
+                                       float y,
+                                       int viewport_width,
+                                       int viewport_height,
+                                       int android_flags) {
+    if (action != ACTION_DOWN && action != ACTION_POINTER_DOWN &&
+        action != ACTION_UP && action != ACTION_POINTER_UP &&
+        action != ACTION_CANCEL) {
+        return;
+    }
+    uint64_t producer_epoch = 0;
+    AdoAsyncRawObserverV1 observer = raw_observer_snapshot(&producer_epoch);
+    if (observer.on_touch == NULL) {
+        return;
+    }
+    AdoAsyncRawTouchEventV1 raw_event;
+    memset(&raw_event, 0, sizeof(raw_event));
+    raw_event.struct_size = sizeof(raw_event);
+    raw_event.abi_version = ADOFAI_ASYNC_RAW_OBSERVER_ABI_V1;
+    raw_event.raw_ns = raw_ns;
+    raw_event.producer_epoch = producer_epoch;
+    raw_event.action = action;
+    raw_event.pointer_id = pointer_id;
+    raw_event.pointer_count = pointer_count;
+    raw_event.source = source;
+    raw_event.device_id = device_id;
+    raw_event.viewport_width = viewport_width;
+    raw_event.viewport_height = viewport_height;
+    raw_event.x = x;
+    raw_event.y = y;
+    raw_event.android_flags = (uint32_t)android_flags;
+    observer.on_touch(observer.user_data, &raw_event);
+}
+
+static void publish_raw_key_observer(int action,
+                                     int key_code,
+                                     int scan_code,
+                                     int meta_state,
+                                     int device_id,
+                                     int repeat_count,
+                                     int source,
+                                     uint64_t raw_ns,
+                                     int android_flags) {
+    if (action != KEY_ACTION_DOWN && action != KEY_ACTION_UP) {
+        return;
+    }
+    uint64_t producer_epoch = 0;
+    AdoAsyncRawObserverV1 observer = raw_observer_snapshot(&producer_epoch);
+    if (observer.on_key == NULL) {
+        return;
+    }
+    AdoAsyncRawKeyEventV1 raw_event;
+    memset(&raw_event, 0, sizeof(raw_event));
+    raw_event.struct_size = sizeof(raw_event);
+    raw_event.abi_version = ADOFAI_ASYNC_RAW_OBSERVER_ABI_V1;
+    raw_event.raw_ns = raw_ns;
+    raw_event.producer_epoch = producer_epoch;
+    raw_event.action = action;
+    raw_event.key_code = key_code;
+    raw_event.scan_code = scan_code;
+    raw_event.meta_state = meta_state;
+    raw_event.device_id = device_id;
+    raw_event.repeat_count = repeat_count;
+    raw_event.source = source;
+    raw_event.android_flags = android_flags;
+    observer.on_key(observer.user_data, &raw_event);
+}
+
 JNIEXPORT jboolean JNICALL
 Java_com_fizzd_connectedworlds_editorport_ExtraMenuUnityPlayerActivity_nativeOnTouchEvent(JNIEnv *env, jclass clazz, jobject event, jint view_width, jint view_height) {
     (void)clazz;
@@ -3133,7 +3266,10 @@ Java_com_fizzd_connectedworlds_editorport_ExtraMenuUnityPlayerActivity_nativeOnT
     int action = 0;
     int index = 0;
     int pointer_id = 0;
+    int pointer_count = 1;
     int source = SOURCE_TOUCHSCREEN;
+    int device_id = 0;
+    int android_flags = 0;
     uint64_t raw_ns = 0;
     float x = 0.0f;
     float y = 0.0f;
@@ -3143,7 +3279,10 @@ Java_com_fizzd_connectedworlds_editorport_ExtraMenuUnityPlayerActivity_nativeOnT
         action = native_event.action;
         index = native_event.index;
         pointer_id = native_event.pointer_id;
+        pointer_count = native_event.pointer_count;
         source = native_event.source;
+        device_id = native_event.device_id;
+        android_flags = native_event.android_flags;
         raw_ns = native_event.raw_ns;
         x = native_event.x;
         y = native_event.y;
@@ -3155,7 +3294,10 @@ Java_com_fizzd_connectedworlds_editorport_ExtraMenuUnityPlayerActivity_nativeOnT
         action = (*env)->CallIntMethod(env, event, g_motion_methods.getActionMasked);
         index = (*env)->CallIntMethod(env, event, g_motion_methods.getActionIndex);
         pointer_id = (*env)->CallIntMethod(env, event, g_motion_methods.getPointerId, index);
+        pointer_count = g_motion_methods.getPointerCount ? (*env)->CallIntMethod(env, event, g_motion_methods.getPointerCount) : 1;
         source = g_motion_methods.getSource ? (*env)->CallIntMethod(env, event, g_motion_methods.getSource) : SOURCE_TOUCHSCREEN;
+        device_id = g_motion_methods.getDeviceId ? (*env)->CallIntMethod(env, event, g_motion_methods.getDeviceId) : 0;
+        android_flags = g_motion_methods.getFlags ? (*env)->CallIntMethod(env, event, g_motion_methods.getFlags) : 0;
         if (g_motion_methods.getX != NULL && g_motion_methods.getY != NULL) {
             x = (*env)->CallFloatMethod(env, event, g_motion_methods.getX, index);
             y = (*env)->CallFloatMethod(env, event, g_motion_methods.getY, index);
@@ -3167,6 +3309,19 @@ Java_com_fizzd_connectedworlds_editorport_ExtraMenuUnityPlayerActivity_nativeOnT
         }
         raw_ns = java_event_time_ns(env, event);
     }
+
+    publish_raw_touch_observer(
+        action,
+        pointer_id,
+        pointer_count,
+        source,
+        device_id,
+        raw_ns,
+        x,
+        y,
+        (int)view_width,
+        (int)view_height,
+        android_flags);
 
     if (controller_pause_releases_input_cached()) {
         return JNI_FALSE;
@@ -3252,15 +3407,23 @@ Java_com_fizzd_connectedworlds_editorport_ExtraMenuUnityPlayerActivity_nativeOnK
     int native_ok = native_key_snapshot(env, event, &native_event);
     int action = 0;
     int key_code = 0;
+    int scan_code = 0;
     int meta_state = 0;
+    int device_id = 0;
     int repeat_count = 0;
+    int source = SOURCE_KEYBOARD;
+    int android_flags = 0;
     uint64_t raw_ns = 0;
 
     if (native_ok) {
         action = native_event.action;
         key_code = native_event.key_code;
+        scan_code = native_event.scan_code;
         meta_state = native_event.meta_state;
+        device_id = native_event.device_id;
         repeat_count = native_event.repeat_count;
+        source = native_event.source;
+        android_flags = native_event.android_flags;
         raw_ns = native_event.raw_ns;
     } else {
         if (!ensure_key_methods(env, event)) {
@@ -3268,14 +3431,29 @@ Java_com_fizzd_connectedworlds_editorport_ExtraMenuUnityPlayerActivity_nativeOnK
         }
         action = (*env)->CallIntMethod(env, event, g_key_methods.getAction);
         key_code = (*env)->CallIntMethod(env, event, g_key_methods.getKeyCode);
+        scan_code = g_key_methods.getScanCode ? (*env)->CallIntMethod(env, event, g_key_methods.getScanCode) : 0;
         meta_state = g_key_methods.getMetaState ? (*env)->CallIntMethod(env, event, g_key_methods.getMetaState) : 0;
+        device_id = g_key_methods.getDeviceId ? (*env)->CallIntMethod(env, event, g_key_methods.getDeviceId) : 0;
         repeat_count = g_key_methods.getRepeatCount ? (*env)->CallIntMethod(env, event, g_key_methods.getRepeatCount) : 0;
+        source = g_key_methods.getSource ? (*env)->CallIntMethod(env, event, g_key_methods.getSource) : SOURCE_KEYBOARD;
+        android_flags = g_key_methods.getFlags ? (*env)->CallIntMethod(env, event, g_key_methods.getFlags) : 0;
         if ((*env)->ExceptionCheck(env)) {
             (*env)->ExceptionClear(env);
             return JNI_FALSE;
         }
         raw_ns = java_event_time_ns(env, event);
     }
+
+    publish_raw_key_observer(
+        action,
+        key_code,
+        scan_code,
+        meta_state,
+        device_id,
+        repeat_count,
+        source,
+        raw_ns,
+        android_flags);
 
     if (controller_pause_releases_input_cached()) {
         return JNI_FALSE;
@@ -5494,6 +5672,87 @@ static void *resolve_dynsym(const char *soname, const char *symbol) {
     return lookup.address;
 }
 
+static const char *async_basename(const char *path) {
+    const char *slash = path != NULL ? strrchr(path, '/') : NULL;
+    return slash != NULL ? slash + 1 : path;
+}
+
+static uint64_t async_pointer_cookie(uintptr_t address, pid_t pid) {
+    uint64_t value = ((uint64_t)address) ^
+        (((uint64_t)(uint32_t)pid) << 32) ^ UINT64_C(0xa6d0f14c9e3779b9);
+    value ^= value >> 33;
+    value *= UINT64_C(0xff51afd7ed558ccd);
+    value ^= value >> 33;
+    value *= UINT64_C(0xc4ceb9fe1a85ec53);
+    value ^= value >> 33;
+    return value;
+}
+
+__attribute__((visibility("default")))
+void *ADOFAIAsyncInputGetIl2CppHandleV1(void) {
+    void *return_address = __builtin_extract_return_addr(__builtin_return_address(0));
+    Dl_info caller;
+    memset(&caller, 0, sizeof(caller));
+    if (return_address == NULL || dladdr(return_address, &caller) == 0 ||
+        caller.dli_fname == NULL) {
+        return NULL;
+    }
+
+    const char *caller_name = async_basename(caller.dli_fname);
+    if (strcmp(caller_name, "libadofai_extra_menu.so") != 0 &&
+        strcmp(caller_name, "libstarray_modmanager.so") != 0) {
+        return NULL;
+    }
+
+    pthread_mutex_lock(&g_metadata_lock);
+    void *handle = g_il2cpp_api.handle;
+    void *mapped_domain_get = handle != NULL
+        ? resolve_dynsym("libil2cpp.so", "il2cpp_domain_get")
+        : NULL;
+    void *handle_domain_get = handle != NULL
+        ? dlsym(handle, "il2cpp_domain_get")
+        : NULL;
+    if (mapped_domain_get == NULL || handle_domain_get != mapped_domain_get) {
+        handle = NULL;
+    }
+    pthread_mutex_unlock(&g_metadata_lock);
+    return handle;
+}
+
+static int async_publish_il2cpp_handle_provider(void) {
+    uintptr_t address = (uintptr_t)&ADOFAIAsyncInputGetIl2CppHandleV1;
+    pid_t pid = getpid();
+
+    (void)mkdir(IL2CPP_HANDLE_PROVIDER_DIR, 0700);
+    int fd = open(IL2CPP_HANDLE_PROVIDER_PTR_TMP_PATH,
+                  O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW,
+                  0600);
+    if (fd < 0) {
+        LOGW("IL2CPP handle provider publish open failed errno=%d", errno);
+        return 0;
+    }
+    int written = dprintf(
+        fd,
+        "ADOASYNCIL2CPPHANDLE1\n%ld\n%" PRIxPTR "\n%016" PRIx64 "\n",
+        (long)pid,
+        address,
+        async_pointer_cookie(address, pid));
+    if (written <= 0 || fsync(fd) != 0) {
+        LOGW("IL2CPP handle provider publish write failed errno=%d", errno);
+        close(fd);
+        unlink(IL2CPP_HANDLE_PROVIDER_PTR_TMP_PATH);
+        return 0;
+    }
+    close(fd);
+    if (rename(IL2CPP_HANDLE_PROVIDER_PTR_TMP_PATH,
+               IL2CPP_HANDLE_PROVIDER_PTR_PATH) != 0) {
+        LOGW("IL2CPP handle provider publish rename failed errno=%d", errno);
+        unlink(IL2CPP_HANDLE_PROVIDER_PTR_TMP_PATH);
+        return 0;
+    }
+    return 1;
+}
+
 static void *load_symbol(void *handle, const char *name) {
     (void)handle;
     void *symbol = resolve_dynsym("libil2cpp.so", name);
@@ -6958,6 +7217,10 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *reserved) {
     (void)reserved;
     LOGI("JNI_OnLoad entered");
     (void)vm;
+
+    if (!async_publish_il2cpp_handle_provider()) {
+        LOGW("IL2CPP handle provider pointer unavailable");
+    }
 
     pthread_t thread;
     int rc = pthread_create(&thread, NULL, patch_thread_main, NULL);
