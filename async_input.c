@@ -16,7 +16,12 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "adofai_app_files.h"
+#include "async_auto_replay.h"
+#include "async_capture_gate.h"
+#include "async_ingress_queue.h"
 #include "async_input_observer_abi.h"
+#include "async_runtime_gate.h"
 #include "dobby.h"
 
 #define LOG_TAG "ADOFAI_ASYNC_INPUT"
@@ -27,16 +32,23 @@
 #define ADO_LIKELY(x) __builtin_expect(!!(x), 1)
 #define ADO_UNLIKELY(x) __builtin_expect(!!(x), 0)
 
-#define PACKAGE_NAME "com.fizzd.connectedworlds.leveleditor.debug"
-#define CFG_PATH "/data/data/" PACKAGE_NAME "/files/adofai_async_input.cfg"
-#define AUTO_REPLAY_CFG_PATH "/data/data/" PACKAGE_NAME "/files/adofai_async_auto_replay.cfg"
-#define TRACE_CFG_PATH "/data/data/" PACKAGE_NAME "/files/adofai_async_trace.cfg"
-#define TEST_MACRO_CFG_PATH "/data/data/" PACKAGE_NAME "/files/adofai_async_test_macro.cfg"
-#define IL2CPP_HANDLE_PROVIDER_DIR "/data/data/" PACKAGE_NAME "/files"
-#define IL2CPP_HANDLE_PROVIDER_PTR_PATH \
-    IL2CPP_HANDLE_PROVIDER_DIR "/adofai_async_il2cpp_handle_provider.ptr"
-#define IL2CPP_HANDLE_PROVIDER_PTR_TMP_PATH \
-    IL2CPP_HANDLE_PROVIDER_DIR "/adofai_async_il2cpp_handle_provider.ptr.tmp"
+static AdoAppFilesState g_app_files_state = ADO_APP_FILES_STATE_INITIALIZER;
+static pthread_mutex_t g_app_paths_config_lock = PTHREAD_MUTEX_INITIALIZER;
+static char g_app_files_dir[PATH_MAX];
+static char g_cfg_path[PATH_MAX];
+static char g_auto_replay_cfg_path[PATH_MAX];
+static char g_trace_cfg_path[PATH_MAX];
+static char g_test_macro_cfg_path[PATH_MAX];
+static char g_il2cpp_handle_provider_ptr_path[PATH_MAX];
+static char g_il2cpp_handle_provider_ptr_tmp_path[PATH_MAX];
+
+#define APP_FILES_DIR g_app_files_dir
+#define CFG_PATH g_cfg_path
+#define AUTO_REPLAY_CFG_PATH g_auto_replay_cfg_path
+#define TRACE_CFG_PATH g_trace_cfg_path
+#define TEST_MACRO_CFG_PATH g_test_macro_cfg_path
+#define IL2CPP_HANDLE_PROVIDER_PTR_PATH g_il2cpp_handle_provider_ptr_path
+#define IL2CPP_HANDLE_PROVIDER_PTR_TMP_PATH g_il2cpp_handle_provider_ptr_tmp_path
 
 #define OFFSET_SCRCONTROLLER_CURRENT_STATE 0xD8u
 #define OFFSET_SCRCONTROLLER_PAUSED 0x1E8u
@@ -90,11 +102,9 @@
 #define BUTTON_IS_UP 3
 
 #define MAX_EVENTS 256
-#define MAX_INGRESS_RECORDS 512
 #define MAX_HELD_SOURCES 64
 #define CAPTURE_START_SUPPRESS_NS 250000000ULL
 #define MULTITAP_BURST_NS 8000000ULL
-#define CAPTURE_STALE_TICKS 10000000ULL
 /*
  * CLOCK_REALTIME and CLOCK_MONOTONIC only slew apart by NTP correction
  * (<= 500 ppm, i.e. a few ns per frame), so 20 ms is far above the noise floor
@@ -111,10 +121,11 @@
 #define IL2CPP_METADATA_POLL_US (500 * 1000)
 #define EVENT_DOWN 1
 #define EVENT_UP 2
-#define INGRESS_EVENT 1
-#define INGRESS_RESET 2
-#define INGRESS_SOFT_PAUSE 3
-#define INGRESS_SOFT_RESUME 4
+#define INGRESS_EVENT_SEAL_TIMEOUT_MS 2
+#define INGRESS_EVENT ADO_ASYNC_INGRESS_EVENT
+#define INGRESS_RESET ADO_ASYNC_INGRESS_RESET
+#define INGRESS_SOFT_PAUSE ADO_ASYNC_INGRESS_SOFT_PAUSE
+#define INGRESS_SOFT_RESUME ADO_ASYNC_INGRESS_SOFT_RESUME
 #define RESET_BARRIER_TIMEOUT_MS 5
 #define REPLAY_MODE_NONE 0
 #define REPLAY_MODE_LEGACY 1
@@ -390,19 +401,14 @@ typedef struct KeyEventSnapshot {
     uint64_t raw_ns;
 } KeyEventSnapshot;
 
-typedef struct IngressRecord {
-    int kind;
-    int event_type;
-    int source_id;
-    uint64_t raw_ns;
-    uint64_t seq;
-} IngressRecord;
+typedef AdoAsyncIngressRecord IngressRecord;
 
 static Il2CppApi g_il2cpp_api;
 static uint64_t g_raw_observer_producer_epoch = 1;
 static pthread_mutex_t g_raw_observer_lock = PTHREAD_MUTEX_INITIALIZER;
 static AdoAsyncRawObserverV1 g_raw_observer;
 static volatile int g_enabled = 0;
+static int g_requested_enabled = 0;
 static volatile int g_auto_replay_enabled = 1;
 static volatile int g_trace_enabled = 0;
 static volatile int g_test_macro_enabled = 0;
@@ -412,6 +418,7 @@ static volatile int g_in_async_replay = 0;
 static volatile int g_current_replay_is_synthetic_auto = 0;
 static volatile int g_current_replay_is_synthetic_test = 0;
 static volatile int g_in_auto_state_machine_replay = 0;
+static AdoAsyncAutoReplayTransaction *g_auto_replay_transaction = NULL;
 static volatile int g_in_conductor_frame __attribute__((unused)) = 0;
 static volatile int g_in_playercontrol_original = 0;
 static volatile int g_in_playercontrol_frame = 0;
@@ -559,10 +566,15 @@ static volatile int g_il2cpp_init_utf16_hook_installed = 0;
 static Il2CppInitFn g_original_il2cpp_init = NULL;
 static Il2CppInitUtf16Fn g_original_il2cpp_init_utf16 = NULL;
 
+static int async_hooks_ready(void) {
+    return __atomic_load_n(&g_hooks_installed, __ATOMIC_ACQUIRE) != 0;
+}
+
 static void ensure_metadata_ready_lazy(void);
 static void mark_il2cpp_init_completed(const char *reason);
 static int capture_gate_open(void);
-static void enqueue_event(int type, int source_id, uint64_t raw_ns);
+static int enqueue_event(int type, int source_id, uint64_t raw_ns);
+static int ingress_wait_processed(uint64_t seq, int timeout_ms);
 static void clear_ui_sources(void);
 static int ensure_mask_api_ready(void);
 static int cache_method_from_class(void *class_ptr, const char *method_name, int args_count, Il2CppMethodCache *out);
@@ -583,13 +595,14 @@ static void async_masks_clear_tick_edges(void);
 static void apply_primary_key_masks(int down, int up, int held_count);
 static void restore_regular_input_types(void);
 static void force_async_input_types(void);
-static int consume_auto_hit_via_async_state_machine(void *player_self);
+static int consume_auto_hit_via_async_state_machine(
+    void *player_self,
+    int *hit_result_out);
 static int post_test_macro_input_for_controller(void *controller_self);
 static void restore_async_angle_to_tick(void *controller_self, uint64_t tick);
 static uint64_t current_async_frame_tick_or_now(void);
 static void suppress_async_camera_override_marker(void);
 static void close_async_capture(void);
-static void disable_async_for_dlc_if_needed(const char *reason);
 static void stop_capture_and_clear_queue(void);
 static void cache_controller_paused_state(int paused);
 static int capture_accepts_raw_ns(uint64_t raw_ns);
@@ -648,9 +661,7 @@ static int g_test_macro_hold_seq = -1;
 static int g_test_macro_hold_source_id = SYNTHETIC_TEST_SOURCE_ID;
 static uint64_t g_test_macro_hold_release_tick = 0;
 static int g_test_macro_hold_release_mode = 0;
-static IngressRecord g_ingress_queue[MAX_INGRESS_RECORDS];
-static int g_ingress_head = 0;
-static int g_ingress_count = 0;
+static AdoAsyncIngressQueue g_ingress_queue;
 static uint64_t g_ingress_seq = 0;
 static uint64_t g_ingress_processed_seq = 0;
 static int g_input_thread_started = 0;
@@ -746,6 +757,7 @@ static IntStaticFn g_original_rdinput_get_main_press_count = NULL;
 static GetHitMarginFn g_original_get_hit_margin = NULL;
 static VoidSelfFn g_original_playercontrol_update = NULL;
 static VoidSelfFn g_original_editor_update = NULL;
+static VoidSelfFn g_original_fail2_action = NULL;
 static SetPausedFn __attribute__((unused)) g_original_set_paused = NULL;
 static BoolSelfFn g_original_scrplayer_get_auto = NULL;
 static HitSelfBoolFn g_original_scrplayer_hit = NULL;
@@ -1180,23 +1192,18 @@ static void set_capture_gate_locked(int ready, uint64_t tick) {
     g_last_playercontrol_wall_tick = ready ? tick : 0;
 }
 
-static int ingress_push_locked(const IngressRecord *record) {
+static int ingress_push_event_locked(const IngressRecord *record) {
     if (record == NULL) {
         return 0;
     }
-    if (g_ingress_count == MAX_INGRESS_RECORDS) {
-        uint64_t dropped_seq = g_ingress_queue[g_ingress_head].seq;
-        g_ingress_head = (g_ingress_head + 1) % MAX_INGRESS_RECORDS;
-        g_ingress_count--;
-        if (g_ingress_processed_seq < dropped_seq) {
-            g_ingress_processed_seq = dropped_seq;
-        }
-        pthread_cond_broadcast(&g_ingress_cond);
-        LOGW("ingress queue overflow, dropped oldest");
+    IngressRecord dropped;
+    memset(&dropped, 0, sizeof(dropped));
+    (void)ado_async_ingress_push_event(
+        &g_ingress_queue, *record, &dropped);
+    if (dropped.seq != 0) {
+        LOGW("ingress event queue overflow, dropped event seq=%" PRIu64,
+             dropped.seq);
     }
-    int index = (g_ingress_head + g_ingress_count) % MAX_INGRESS_RECORDS;
-    g_ingress_queue[index] = *record;
-    g_ingress_count++;
     pthread_cond_signal(&g_ingress_cond);
     return 1;
 }
@@ -1224,8 +1231,24 @@ static int ingress_post_event(int event_type, int source_id, uint64_t raw_ns) {
 
     pthread_mutex_lock(&g_ingress_lock);
     record.seq = ++g_ingress_seq;
-    int ok = ingress_push_locked(&record);
+    int ok = ingress_push_event_locked(&record);
     pthread_mutex_unlock(&g_ingress_lock);
+    if (ok && (event_type == EVENT_DOWN || event_type == EVENT_UP)) {
+        /* Keep Android producers asynchronous while closing the ordinary
+         * producer-to-replay visibility gap when the worker is healthy. */
+        if (!ingress_wait_processed(record.seq, INGRESS_EVENT_SEAL_TIMEOUT_MS)) {
+            static uint64_t last_seal_timeout_log_ns = 0;
+            uint64_t timeout_now_ns = monotonic_ns_now();
+            if (timeout_now_ns - last_seal_timeout_log_ns >= 1000000000ULL) {
+                last_seal_timeout_log_ns = timeout_now_ns;
+                LOGW("input event seal wait timed out seq=%" PRIu64
+                     " type=%d source=%d",
+                     record.seq,
+                     event_type,
+                     source_id);
+            }
+        }
+    }
     if (ok && g_trace_enabled) {
         uint64_t count = __atomic_add_fetch(&g_ingress_event_posted_count, 1, __ATOMIC_RELAXED);
         if (count <= 8 || (count % 64ULL) == 0) {
@@ -1238,7 +1261,38 @@ static int ingress_post_event(int event_type, int source_id, uint64_t raw_ns) {
     return ok;
 }
 
-static void ingress_post_command(int kind, int wait_for_ack) {
+static int ingress_wait_processed(uint64_t seq, int timeout_ms) {
+    if (seq == 0 || timeout_ms <= 0) {
+        return 0;
+    }
+
+    struct timespec deadline;
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_nsec += (long)timeout_ms * 1000000L;
+    if (deadline.tv_nsec >= 1000000000L) {
+        deadline.tv_sec += deadline.tv_nsec / 1000000000L;
+        deadline.tv_nsec %= 1000000000L;
+    }
+
+    pthread_mutex_lock(&g_ingress_lock);
+    if (!g_input_thread_started || g_input_thread_stop) {
+        pthread_mutex_unlock(&g_ingress_lock);
+        return 0;
+    }
+    while (g_ingress_processed_seq < seq && !g_input_thread_stop) {
+        int rc = pthread_cond_timedwait(
+            &g_ingress_cond, &g_ingress_lock, &deadline);
+        if (rc != 0) {
+            pthread_mutex_unlock(&g_ingress_lock);
+            return 0;
+        }
+    }
+    int processed = g_ingress_processed_seq >= seq;
+    pthread_mutex_unlock(&g_ingress_lock);
+    return processed;
+}
+
+static int ingress_post_command(int kind, int wait_for_ack) {
     IngressRecord record;
     memset(&record, 0, sizeof(record));
     record.kind = kind;
@@ -1253,31 +1307,46 @@ static void ingress_post_command(int kind, int wait_for_ack) {
     }
 
     pthread_mutex_lock(&g_ingress_lock);
+    if (!ado_async_ingress_control_has_capacity(&g_ingress_queue)) {
+        pthread_mutex_unlock(&g_ingress_lock);
+        LOGE("ingress control queue full, command rejected kind=%d", kind);
+        return 0;
+    }
     uint64_t seq = ++g_ingress_seq;
     record.seq = seq;
-    ingress_push_locked(&record);
+    if (ado_async_ingress_push_control(&g_ingress_queue, record) !=
+        ADO_ASYNC_INGRESS_PUSHED) {
+        pthread_mutex_unlock(&g_ingress_lock);
+        LOGE("ingress control queue rejected command kind=%d seq=%" PRIu64,
+             kind, seq);
+        return 0;
+    }
+    pthread_cond_signal(&g_ingress_cond);
+    int result = 1;
     if (wait_for_ack) {
         while (g_ingress_processed_seq < seq) {
             int rc = pthread_cond_timedwait(&g_ingress_cond, &g_ingress_lock, &deadline);
             if (rc != 0) {
                 LOGW("reset barrier timed out");
+                result = -1;
                 break;
             }
         }
     }
     pthread_mutex_unlock(&g_ingress_lock);
+    return result;
 }
 
 static void ingress_post_reset(int wait_for_ack) {
-    ingress_post_command(INGRESS_RESET, wait_for_ack);
+    (void)ingress_post_command(INGRESS_RESET, wait_for_ack);
 }
 
 static void ingress_post_soft_pause(int wait_for_ack) {
-    ingress_post_command(INGRESS_SOFT_PAUSE, wait_for_ack);
+    (void)ingress_post_command(INGRESS_SOFT_PAUSE, wait_for_ack);
 }
 
 static void ingress_post_soft_resume(void) {
-    ingress_post_command(INGRESS_SOFT_RESUME, 0);
+    (void)ingress_post_command(INGRESS_SOFT_RESUME, 0);
 }
 
 static void ingress_mark_processed(uint64_t seq) {
@@ -1294,19 +1363,18 @@ static int ingress_pop(IngressRecord *out) {
         return 0;
     }
     pthread_mutex_lock(&g_ingress_lock);
-    while (g_ingress_count == 0 && !g_input_thread_stop) {
+    while (ado_async_ingress_count(&g_ingress_queue) == 0 &&
+           !g_input_thread_stop) {
         pthread_cond_wait(&g_ingress_cond, &g_ingress_lock);
     }
     if (g_input_thread_stop) {
         pthread_mutex_unlock(&g_ingress_lock);
         return 0;
     }
-    *out = g_ingress_queue[g_ingress_head];
-    g_ingress_head = (g_ingress_head + 1) % MAX_INGRESS_RECORDS;
-    g_ingress_count--;
+    int ok = ado_async_ingress_pop(&g_ingress_queue, out);
     pthread_cond_broadcast(&g_ingress_cond);
     pthread_mutex_unlock(&g_ingress_lock);
-    return 1;
+    return ok;
 }
 
 static void *input_thread_main(void *arg) {
@@ -1410,28 +1478,8 @@ static void ensure_input_thread_started(void) {
 }
 
 static int capture_gate_open(void) {
-    pthread_mutex_lock(&g_scene_state_lock);
-    int dlc_disabled = g_scene_state_ready && g_cached_is_dlc_level;
-    pthread_mutex_unlock(&g_scene_state_lock);
-    if (dlc_disabled) {
-        return 0;
-    }
-
     pthread_mutex_lock(&g_lock);
     int open = g_capture_ready && g_last_playercontrol_wall_tick != 0;
-    if (open) {
-        uint64_t now = wall_ticks_now();
-        if (now >= g_last_playercontrol_wall_tick &&
-            now - g_last_playercontrol_wall_tick > CAPTURE_STALE_TICKS) {
-            clear_runtime_state_locked();
-            set_capture_gate_locked(0, 0);
-            g_capture_floor_raw_ns = 0;
-            open = 0;
-            if (g_trace_enabled) {
-                LOGI("capture gate stale closed");
-            }
-        }
-    }
     pthread_mutex_unlock(&g_lock);
     return open ? 1 : 0;
 }
@@ -1770,23 +1818,15 @@ static int editor_blocks_async(void) {
     return editor_blocks_async_cached();
 }
 
-static int dlc_async_disabled_cached(void) {
-    pthread_mutex_lock(&g_scene_state_lock);
-    int disabled = g_scene_state_ready && g_cached_is_dlc_level;
-    pthread_mutex_unlock(&g_scene_state_lock);
-    return disabled ? 1 : 0;
-}
-
 static int scene_allows_async_gameplay_cached(void) {
     pthread_mutex_lock(&g_scene_state_lock);
     int ready = g_scene_state_ready;
     int gameworld = g_cached_gameworld;
     int is_level_editor = g_cached_is_level_editor;
     int editor_play = g_cached_editor_play_mode;
-    int is_dlc = g_cached_is_dlc_level;
     int paused = g_cached_controller_paused;
     pthread_mutex_unlock(&g_scene_state_lock);
-    return ready && !is_dlc && !paused && gameworld && (!is_level_editor || editor_play);
+    return ready && !paused && gameworld && (!is_level_editor || editor_play);
 }
 
 static void cache_controller_paused_state(int paused) {
@@ -1945,7 +1985,7 @@ static void refresh_scene_state_on_main_thread(const char *reason, void *control
         (void)try_controller_destination_state(controller_self, &destination_state);
     }
     int capture = capture_gate_open();
-    int async_blocks = is_dlc_level || !gameworld || (is_level_editor && !editor_play_mode);
+    int async_blocks = !gameworld || (is_level_editor && !editor_play_mode);
 
     pthread_mutex_lock(&g_scene_state_lock);
     g_scene_state_ready = 1;
@@ -2188,16 +2228,16 @@ static void ensure_async_clock_fields(uint64_t tick, int64_t fix_divider) {
     }
 }
 
-static void enqueue_event(int type, int source_id, uint64_t raw_ns) {
+static int enqueue_event(int type, int source_id, uint64_t raw_ns) {
     if (!g_enabled || !capture_gate_open()) {
-        return;
+        return 0;
     }
 
     pthread_mutex_lock(&g_lock);
 
     if (!g_enabled || !g_capture_ready || g_last_playercontrol_wall_tick == 0) {
         pthread_mutex_unlock(&g_lock);
-        return;
+        return 0;
     }
 
     int synthetic_auto = (source_id == SYNTHETIC_AUTO_SOURCE_ID);
@@ -2213,12 +2253,12 @@ static void enqueue_event(int type, int source_id, uint64_t raw_ns) {
                 g_physical_sources[g_physical_count++] = source_id;
             } else {
                 pthread_mutex_unlock(&g_lock);
-                return;
+                return 0;
             }
         } else {
             if (physical_index < 0) {
                 pthread_mutex_unlock(&g_lock);
-                return;
+                return 0;
             }
             remove_source_at_locked(g_physical_sources, &g_physical_count, physical_index);
         }
@@ -2240,7 +2280,7 @@ static void enqueue_event(int type, int source_id, uint64_t raw_ns) {
             }
         } else {
             pthread_mutex_unlock(&g_lock);
-            return;
+            return 0;
         }
     }
 
@@ -2268,6 +2308,7 @@ static void enqueue_event(int type, int source_id, uint64_t raw_ns) {
         LOGI("enqueue %sUP raw_ns=%" PRIu64 " src=%d queue=%d",
              synthetic_prefix, raw_ns, source_id, queue_count_after);
     }
+    return 1;
 }
 
 static int prepare_replay_step(uint64_t target_tick, uint64_t *step_limit) {
@@ -2547,16 +2588,16 @@ static void notify_raw_observer_enabled_changed(int enabled) {
     }
 }
 
-static void set_enabled_internal(int enabled, int persist) {
-    int requested = enabled ? 1 : 0;
-    if (persist) {
-        /* Preserve the requested state while the runtime bridge is starting. */
-        save_bool_file(CFG_PATH, requested);
-    }
-
-    int normalized = requested;
+/* g_requested_enabled is persisted user intent; g_enabled is the active
+ * runtime state and remains false until the hook transaction is complete. */
+static void apply_runtime_enabled_locked(int active) {
+    int normalized = active ? 1 : 0;
     int changed = (g_enabled != normalized);
     g_enabled = normalized;
+    if (!changed) {
+        return;
+    }
+
     if (!normalized) {
         pthread_mutex_lock(&g_lock);
         set_capture_gate_locked(0, 0);
@@ -2570,13 +2611,33 @@ static void set_enabled_internal(int enabled, int persist) {
     } else {
         update_time_origin();
         ensure_input_thread_started();
-        ingress_post_reset(0);
+        (void)ingress_post_command(INGRESS_RESET, 0);
         g_last_update_input_frame = -1;
         g_last_update_input_controller = NULL;
     }
-    if (changed) {
-        LOGI("async input %s", normalized ? "ON" : "OFF");
-        notify_raw_observer_enabled_changed(normalized);
+
+    LOGI("async input runtime %s requested=%d",
+         normalized ? "RESUMED" : "SUSPENDED",
+         g_requested_enabled);
+    notify_raw_observer_enabled_changed(normalized);
+}
+
+static void set_enabled_internal(int enabled, int persist) {
+    int requested = enabled ? 1 : 0;
+    if (persist) {
+        save_bool_file(CFG_PATH, requested);
+    }
+
+    int gate_open = !requested || async_hooks_ready();
+    AdoAsyncRuntimeGateState state = {
+        g_requested_enabled,
+        g_enabled
+    };
+    (void)ado_async_runtime_gate_set_requested(&state, requested, gate_open);
+    g_requested_enabled = state.requested;
+    apply_runtime_enabled_locked(state.active);
+    if (requested && !gate_open) {
+        LOGI("async input request retained until runtime hooks are ready");
     }
 }
 
@@ -3616,6 +3677,22 @@ static void leave_playercontrol_original(void) {
     }
 }
 
+static void enter_forced_async_original(void) {
+    __atomic_add_fetch(&g_force_async_active_for_original, 1, __ATOMIC_RELAXED);
+    enter_playercontrol_original();
+}
+
+static void leave_forced_async_original(void) {
+    leave_playercontrol_original();
+    int value = __atomic_sub_fetch(
+        &g_force_async_active_for_original,
+        1,
+        __ATOMIC_RELAXED);
+    if (value < 0) {
+        __atomic_store_n(&g_force_async_active_for_original, 0, __ATOMIC_RELAXED);
+    }
+}
+
 static int __attribute__((unused)) hooked_valid_triggered(void *self, void *method) {
     if (mask_replay_active()) {
         return snapshot_down() > 0;
@@ -3920,33 +3997,48 @@ static void trace_judgement_state(const char *stage, void *player_self, int is_a
 }
 
 static int hooked_scrplayer_get_auto(void *self, void *method) {
-    if (g_enabled &&
+    int original_value = g_original_scrplayer_get_auto(self, method);
+    int synthetic_auto_replay =
+        g_enabled &&
         g_auto_replay_enabled &&
         g_in_async_replay &&
-        __atomic_load_n(&g_current_replay_is_synthetic_auto, __ATOMIC_ACQUIRE)) {
-        return 0;
-    }
-    return g_original_scrplayer_get_auto(self, method);
+        __atomic_load_n(&g_current_replay_is_synthetic_auto, __ATOMIC_ACQUIRE);
+    int auto_transaction_active =
+        __atomic_load_n(&g_in_auto_state_machine_replay, __ATOMIC_ACQUIRE) &&
+        g_auto_replay_transaction != NULL;
+    return ado_async_auto_replay_player_auto_value(
+        original_value,
+        synthetic_auto_replay,
+        auto_transaction_active);
 }
 
 static int hooked_scrplayer_hit(void *self, int is_auto, void *method) {
     if (is_auto &&
         g_enabled &&
         g_auto_replay_enabled &&
-        (__atomic_load_n(&g_in_auto_state_machine_replay, __ATOMIC_ACQUIRE) ||
-         (g_in_async_replay &&
-          __atomic_load_n(&g_current_replay_is_synthetic_auto, __ATOMIC_ACQUIRE)))) {
-        return 0;
-    }
-    if (is_auto && auto_replay_can_intercept()) {
-        if (consume_auto_hit_via_async_state_machine(self)) {
-            return 0;
+        __atomic_load_n(&g_in_auto_state_machine_replay, __ATOMIC_ACQUIRE)) {
+        AdoAsyncAutoReplayTransaction *transaction = g_auto_replay_transaction;
+        if (ado_async_auto_replay_try_begin_commit(transaction)) {
+            trace_judgement_state("Hit.before.autoCommit", self, is_auto, -1);
+            int result = g_original_scrplayer_hit(self, is_auto, method);
+            ado_async_auto_replay_finish_commit(transaction, result);
+
+            /* The automatic hit is this transaction's only floor-changing
+             * action. Clear its synthetic key before nested official code can
+             * reinterpret it against the next floor. */
+            pthread_mutex_lock(&g_lock);
+            g_down_count = 0;
+            g_up_count = 0;
+            g_held_count = 0;
+            g_down_slot_mask = 0;
+            g_up_slot_mask = 0;
+            g_held_slot_mask = 0;
+            pthread_mutex_unlock(&g_lock);
+            apply_primary_key_masks(0, 0, 0);
+            trace_judgement_state("Hit.after.autoCommit", self, is_auto, result);
+            return result;
         }
-        LOGW("AUTO replay state-machine injection failed; falling back to original Hit(isAuto)");
-        trace_judgement_state("Hit.before.fallbackAuto", self, is_auto, -1);
-        int fallback_result = g_original_scrplayer_hit(self, is_auto, method);
-        trace_judgement_state("Hit.after.fallbackAuto", self, is_auto, fallback_result);
-        return fallback_result;
+        return 0;
     }
     if (is_auto &&
         g_enabled &&
@@ -3954,6 +4046,17 @@ static int hooked_scrplayer_hit(void *self, int is_auto, void *method) {
         g_in_async_replay &&
         __atomic_load_n(&g_current_replay_is_synthetic_auto, __ATOMIC_ACQUIRE)) {
         return 0;
+    }
+    if (is_auto && auto_replay_can_intercept()) {
+        int replay_result = 0;
+        if (consume_auto_hit_via_async_state_machine(self, &replay_result)) {
+            return replay_result;
+        }
+        LOGW("AUTO replay state-machine injection failed; falling back to original Hit(isAuto)");
+        trace_judgement_state("Hit.before.fallbackAuto", self, is_auto, -1);
+        int fallback_result = g_original_scrplayer_hit(self, is_auto, method);
+        trace_judgement_state("Hit.after.fallbackAuto", self, is_auto, fallback_result);
+        return fallback_result;
     }
     if (ADO_LIKELY(!g_trace_enabled)) {
         return g_original_scrplayer_hit(self, is_auto, method);
@@ -4329,7 +4432,17 @@ static int controller_allows_async_capture(void *controller_self) {
         return 0;
     }
 
-    return controller_current_state(controller_self) == STATE_PLAYER_CONTROL;
+    int live_gameworld =
+        read_controller_bool_field(controller_self, g_offset_scrcontroller_gameworld);
+    int destination_state = -1;
+    int destination_state_known =
+        try_controller_destination_state(controller_self, &destination_state);
+    return ado_async_controller_allows_capture(
+        live_gameworld,
+        controller_current_state(controller_self),
+        destination_state_known,
+        destination_state,
+        STATE_PLAYER_CONTROL);
 }
 
 static int controller_allows_async_replay(void *controller_self) {
@@ -4350,10 +4463,6 @@ static int controller_allows_async_replay(void *controller_self) {
 
 static void open_capture_for_controller(void *controller_self) {
     if (!g_enabled || !controller_allows_async_capture(controller_self)) {
-        return;
-    }
-    if (dlc_async_disabled_cached()) {
-        disable_async_for_dlc_if_needed("open_capture");
         return;
     }
 
@@ -4682,7 +4791,13 @@ static uint64_t auto_target_tick_for_player(void *player_self, uint64_t fallback
     return target_tick_for_player(player_self, fallback_tick, 1, "AUTO replay");
 }
 
-static int consume_auto_hit_via_async_state_machine(void *player_self) {
+static int consume_auto_hit_via_async_state_machine(
+    void *player_self,
+    int *hit_result_out) {
+    if (hit_result_out == NULL) {
+        return 0;
+    }
+    *hit_result_out = 0;
     void *controller_self = g_current_controller_self != NULL ? g_current_controller_self : read_adobase_controller();
     if (controller_self == NULL || !controller_allows_async_replay(controller_self)) {
         return 0;
@@ -4724,10 +4839,22 @@ static int consume_auto_hit_via_async_state_machine(void *player_self) {
     g_held_slot_mask = 1ULL;
     pthread_mutex_unlock(&g_lock);
 
+    AdoAsyncAutoReplayTransaction transaction;
+    ado_async_auto_replay_transaction_init(&transaction);
+    AdoAsyncAutoReplayTransaction *previous_transaction =
+        g_auto_replay_transaction;
+    int previous_auto_replay =
+        __atomic_load_n(&g_in_auto_state_machine_replay, __ATOMIC_ACQUIRE);
+
     apply_primary_key_masks(1, 0, 1);
+    g_auto_replay_transaction = &transaction;
     __atomic_store_n(&g_in_auto_state_machine_replay, 1, __ATOMIC_RELEASE);
     call_process_key_inputs(controller_self, tick, 0, REPLAY_MODE_MASK, 1, 0);
-    __atomic_store_n(&g_in_auto_state_machine_replay, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(
+        &g_in_auto_state_machine_replay,
+        previous_auto_replay,
+        __ATOMIC_RELEASE);
+    g_auto_replay_transaction = previous_transaction;
     restore_async_angle_to_tick(controller_self, frame_tick);
     write_rdc_auto(old_rdc_auto);
 
@@ -4748,13 +4875,20 @@ static int consume_auto_hit_via_async_state_machine(void *player_self) {
     }
     suppress_async_camera_override_marker();
 
+    if (!ado_async_auto_replay_has_commit(&transaction)) {
+        LOGW("AUTO replay state-machine produced no Hit(isAuto) commit");
+        return 0;
+    }
+    *hit_result_out = transaction.commit_result;
+
     static uint64_t auto_state_machine_count = 0;
     uint64_t count = __atomic_add_fetch(&auto_state_machine_count, 1, __ATOMIC_RELAXED);
     if (g_trace_enabled && (count <= 16 || (count % 64ULL) == 0)) {
-        LOGI("AUTO replay consumed direct Hit(isAuto) via async state machine tick=%" PRIu64
-             " count=%" PRIu64,
+        LOGI("AUTO replay committed Hit(isAuto) via async state machine tick=%" PRIu64
+             " count=%" PRIu64 " result=%d",
              tick,
-             count);
+             count,
+             transaction.commit_result);
     }
     return 1;
 }
@@ -4826,7 +4960,7 @@ static int post_test_macro_input_for_controller(void *controller_self) {
         int hold_source_id = g_test_macro_hold_source_id;
         if (release_tick == 0 || g_test_macro_hold_seq != curr_seq) {
             if (release_mode == TEST_MACRO_HOLD_RELEASE_UP) {
-                (void)ingress_post_event(EVENT_UP, hold_source_id, monotonic_ns_now());
+                (void)enqueue_event(EVENT_UP, hold_source_id, monotonic_ns_now());
             }
             g_test_macro_hold_active = 0;
             g_test_macro_hold_seq = -1;
@@ -4841,10 +4975,10 @@ static int post_test_macro_input_for_controller(void *controller_self) {
         int posted = 0;
         if (release_mode == TEST_MACRO_HOLD_END_TAP) {
             posted =
-                ingress_post_event(EVENT_DOWN, hold_source_id, raw_release) &&
-                ingress_post_event(EVENT_UP, hold_source_id, raw_release + SYNTHETIC_TEST_UP_DELAY_NS);
+                enqueue_event(EVENT_DOWN, hold_source_id, raw_release) &&
+                enqueue_event(EVENT_UP, hold_source_id, raw_release + SYNTHETIC_TEST_UP_DELAY_NS);
         } else {
-            posted = ingress_post_event(EVENT_UP, hold_source_id, raw_release);
+            posted = enqueue_event(EVENT_UP, hold_source_id, raw_release);
         }
         if (!posted) {
             return 0;
@@ -4956,15 +5090,15 @@ static int post_test_macro_input_for_controller(void *controller_self) {
             uint64_t tap_down = test_macro_tap_down_raw(raw_down, i, simultaneous_taps);
             uint64_t tap_up = tap_down + SYNTHETIC_TEST_UP_DELAY_NS;
             int source_id = SYNTHETIC_TEST_SOURCE_ID + i;
-            if (!ingress_post_event(EVENT_DOWN, source_id, tap_down) ||
-                !ingress_post_event(EVENT_UP, source_id, tap_up)) {
+            if (!enqueue_event(EVENT_DOWN, source_id, tap_down) ||
+                !enqueue_event(EVENT_UP, source_id, tap_up)) {
                 return 0;
             }
         }
 
         uint64_t hold_down_raw = test_macro_tap_down_raw(raw_down, tap_events - 1, simultaneous_taps);
         int hold_source_id = SYNTHETIC_TEST_SOURCE_ID + (tap_events - 1);
-        if (!ingress_post_event(EVENT_DOWN, hold_source_id, hold_down_raw)) {
+        if (!enqueue_event(EVENT_DOWN, hold_source_id, hold_down_raw)) {
             return 0;
         }
         g_test_macro_hold_active = 1;
@@ -4974,7 +5108,7 @@ static int post_test_macro_input_for_controller(void *controller_self) {
         g_test_macro_hold_release_mode =
             (hold_behavior == 2) ? TEST_MACRO_HOLD_END_TAP : TEST_MACRO_HOLD_RELEASE_UP;
         if (g_test_macro_hold_release_mode == TEST_MACRO_HOLD_END_TAP) {
-            if (!ingress_post_event(EVENT_UP, hold_source_id, hold_down_raw + SYNTHETIC_TEST_UP_DELAY_NS)) {
+            if (!enqueue_event(EVENT_UP, hold_source_id, hold_down_raw + SYNTHETIC_TEST_UP_DELAY_NS)) {
                 return 0;
             }
         }
@@ -4983,8 +5117,8 @@ static int post_test_macro_input_for_controller(void *controller_self) {
             uint64_t tap_down = test_macro_tap_down_raw(raw_down, i, simultaneous_taps);
             uint64_t tap_up = tap_down + SYNTHETIC_TEST_UP_DELAY_NS;
             int source_id = SYNTHETIC_TEST_SOURCE_ID + i;
-            if (!ingress_post_event(EVENT_DOWN, source_id, tap_down) ||
-                !ingress_post_event(EVENT_UP, source_id, tap_up)) {
+            if (!enqueue_event(EVENT_DOWN, source_id, tap_down) ||
+                !enqueue_event(EVENT_UP, source_id, tap_up)) {
                 return 0;
             }
         }
@@ -5001,7 +5135,8 @@ static int post_test_macro_input_for_controller(void *controller_self) {
              " tapsNeeded=%d tapsPosted=%d pseudoMulti=%d simultaneous=%d multitapBehavior=%d holdBehavior=%d holdLength=%d holdMode=%d"
              " rawDown=%" PRIu64
              " rawUp=%" PRIu64
-             " rawNow=%" PRIu64,
+             " rawNow=%" PRIu64
+             " delivery=unity-direct",
              count,
              event_tick,
              frame_tick,
@@ -5071,10 +5206,6 @@ static int replay_pending_events_via_process_key_inputs(void *controller_self, u
     if (!g_enabled || controller_self == NULL) {
         return 0;
     }
-    if (dlc_async_disabled_cached()) {
-        disable_async_for_dlc_if_needed("replay");
-        return 0;
-    }
     if (!controller_allows_async_replay(controller_self)) {
         if (!controller_allows_async_capture(controller_self)) {
             stop_capture_and_clear_queue();
@@ -5091,8 +5222,10 @@ static int replay_pending_events_via_process_key_inputs(void *controller_self, u
     int synthetic_test = 0;
     int replayed = 0;
     int had_pending = 0;
-    uint64_t now_raw_ns = monotonic_ns_now();
     (void)post_test_macro_input_for_controller(controller_self);
+    /* Synthetic input is committed on this consumer thread. Sample the replay
+     * boundary afterwards so an already-due target is visible this frame. */
+    uint64_t now_raw_ns = monotonic_ns_now();
     pthread_mutex_lock(&g_lock);
     had_pending = queue_active_count_locked() > 0;
     pthread_mutex_unlock(&g_lock);
@@ -5142,20 +5275,17 @@ static void close_async_capture(void) {
     }
 }
 
-static void disable_async_for_dlc_if_needed(const char *reason) {
-    if (!dlc_async_disabled_cached()) {
-        return;
+static void hooked_fail2_action(void *self, void *method) {
+    if (g_enabled) {
+        close_async_capture();
     }
-
-    static int logged_disabled = 0;
-    if (!logged_disabled) {
-        logged_disabled = 1;
-        LOGW("DLC async fuse active reason=%s; capture/masks/clock/replay disabled", reason ? reason : "unknown");
-    }
-    close_async_capture();
+    g_original_fail2_action(self, method);
 }
 
-static void hooked_update_input(void *self, void *method) {
+static void hooked_update_input_internal(
+    void *self,
+    void *method,
+    int refresh_scene) {
     if (!g_enabled) {
         if (g_original_update_input != NULL) {
             g_original_update_input(self, method);
@@ -5183,14 +5313,8 @@ static void hooked_update_input(void *self, void *method) {
     }
 
     g_current_controller_self = self;
-    refresh_scene_state_on_main_thread("UpdateInput", self);
-    if (dlc_async_disabled_cached()) {
-        disable_async_for_dlc_if_needed("UpdateInput");
-        g_current_controller_self = NULL;
-        if (g_original_update_input != NULL) {
-            g_original_update_input(self, method);
-        }
-        return;
+    if (refresh_scene) {
+        refresh_scene_state_on_main_thread("UpdateInput", self);
     }
     if (!controller_allows_async_replay(self)) {
         if (controller_allows_async_capture(self)) {
@@ -5277,6 +5401,10 @@ static void hooked_update_input(void *self, void *method) {
     }
 
     g_current_controller_self = NULL;
+}
+
+static void hooked_update_input(void *self, void *method) {
+    hooked_update_input_internal(self, method, 1);
 }
 
 static void stop_capture_and_clear_queue(void) {
@@ -5379,7 +5507,6 @@ static void __attribute__((unused)) hooked_conductor_update(void *self, void *me
         void *controller = read_adobase_controller();
         if (controller != NULL) {
             refresh_scene_state_on_main_thread("scrConductor.Update.pre", controller);
-            disable_async_for_dlc_if_needed("scrConductor.Update.pre");
         }
     }
     g_original_conductor_update(self, method);
@@ -5391,7 +5518,7 @@ static void drive_editor_async_update(const char *reason) {
     refresh_scene_state_on_main_thread(reason, controller);
 
     if (controller_allows_async_replay(controller)) {
-        hooked_update_input(controller, NULL);
+        hooked_update_input_internal(controller, NULL, 0);
         return;
     }
 
@@ -5411,7 +5538,22 @@ static void hooked_editor_update(void *self, void *method) {
     void *controller = read_adobase_controller();
     refresh_scene_state_on_main_thread("scnEditor.Update.pre", controller);
 
+    int owns_async_input =
+        controller != NULL && controller_allows_async_replay(controller);
+    if (owns_async_input) {
+        hooked_update_input_internal(controller, NULL, 0);
+        owns_async_input =
+            g_enabled &&
+            capture_gate_open() &&
+            controller_allows_async_replay(controller);
+    }
+    if (owns_async_input) {
+        enter_forced_async_original();
+    }
     g_original_editor_update(self, method);
+    if (owns_async_input) {
+        leave_forced_async_original();
+    }
 
     drive_editor_async_update("scnEditor.Update.after");
 }
@@ -5425,15 +5567,6 @@ static void hooked_playercontrol_update(void *self, void *method) {
 
     g_current_controller_self = self;
     refresh_scene_state_on_main_thread("PlayerControl.Update", self);
-    if (dlc_async_disabled_cached()) {
-        disable_async_for_dlc_if_needed("PlayerControl.Update");
-        enter_playercontrol_original();
-        g_original_playercontrol_update(self, method);
-        leave_playercontrol_original();
-        g_current_controller_self = NULL;
-        clear_frame_edges();
-        return;
-    }
     if (!controller_allows_async_replay(self)) {
         if (controller_allows_async_capture(self)) {
             open_capture_for_controller(self);
@@ -5447,6 +5580,7 @@ static void hooked_playercontrol_update(void *self, void *method) {
         g_original_playercontrol_update(self, method);
         leave_playercontrol_original();
         if (controller_allows_async_replay(self)) {
+            /* The original Update may cross a state boundary in this frame. */
             hooked_update_input(self, NULL);
         } else if (!controller_allows_async_capture(self) && capture_gate_open()) {
             close_async_capture();
@@ -5469,14 +5603,12 @@ static void hooked_playercontrol_update(void *self, void *method) {
      * hook must drive the official async mask replay from the PlayerControl
      * state-machine tick as well.
      */
-    hooked_update_input(self, NULL);
+    hooked_update_input_internal(self, NULL, 0);
 
     g_in_playercontrol_frame = 1;
-    g_force_async_active_for_original = 1;
-    enter_playercontrol_original();
+    enter_forced_async_original();
     g_original_playercontrol_update(self, method);
-    leave_playercontrol_original();
-    g_force_async_active_for_original = 0;
+    leave_forced_async_original();
     g_in_playercontrol_frame = 0;
     g_current_controller_self = NULL;
     if (!controller_allows_async_capture(self)) {
@@ -5723,7 +5855,7 @@ static int async_publish_il2cpp_handle_provider(void) {
     uintptr_t address = (uintptr_t)&ADOFAIAsyncInputGetIl2CppHandleV1;
     pid_t pid = getpid();
 
-    (void)mkdir(IL2CPP_HANDLE_PROVIDER_DIR, 0700);
+    (void)mkdir(APP_FILES_DIR, 0700);
     int fd = open(IL2CPP_HANDLE_PROVIDER_PTR_TMP_PATH,
                   O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW,
                   0600);
@@ -7132,6 +7264,13 @@ static int install_method_hook(const MethodHookSpec *spec) {
 
 static void *patch_thread_main(void *arg) {
     (void)arg;
+    char configured_files_dir[PATH_MAX];
+    if (!ado_app_files_wait(&g_app_files_state,
+                            configured_files_dir,
+                            sizeof(configured_files_dir))) {
+        LOGE("app files directory initialization failed; hooks not installed");
+        return NULL;
+    }
     LOGI("patch thread started, waiting for libil2cpp.so");
 
     for (int i = 0; i < IL2CPP_BASE_WAIT_ATTEMPTS; ++i) {
@@ -7144,7 +7283,6 @@ static void *patch_thread_main(void *arg) {
         LOGI("libil2cpp.so found base=0x%lx", (unsigned long)base);
         install_il2cpp_state_hooks();
         update_time_origin();
-        apply_persisted_control_state();
 
         reset_metadata_state();
         g_offset_scrcontroller_current_state = OFFSET_SCRCONTROLLER_CURRENT_STATE;
@@ -7172,6 +7310,7 @@ static void *patch_thread_main(void *arg) {
             {"", "scrCamera", "UpdateFollowCam", 1, (void *)&hooked_camera_update_follow_cam, (void **)&g_original_camera_update_follow_cam, "scrCamera.UpdateFollowCam", 1},
             {"", "scnEditor", "Update", 0, (void *)&hooked_editor_update, (void **)&g_original_editor_update, "scnEditor.Update", 1},
             {"", "scrController", "set_paused", 1, (void *)&hooked_set_paused, (void **)&g_original_set_paused, "scrController.set_paused", 0},
+            {"", "scrController", "Fail2Action", 0, (void *)&hooked_fail2_action, (void **)&g_original_fail2_action, "scrController.Fail2Action", 1},
             {"", "scrController", "PlayerControl_Update", 0, (void *)&hooked_playercontrol_update, (void **)&g_original_playercontrol_update, "scrController.PlayerControl_Update", 1},
         };
 
@@ -7204,7 +7343,8 @@ static void *patch_thread_main(void *arg) {
             return NULL;
         }
 
-        g_hooks_installed = 1;
+        __atomic_store_n(&g_hooks_installed, 1, __ATOMIC_RELEASE);
+        apply_persisted_control_state();
         LOGI("all hooks installed, enabled=%d, metadata_ready=%d", g_enabled, metadata_ready);
         return NULL;
     }
@@ -7213,14 +7353,81 @@ static void *patch_thread_main(void *arg) {
     return NULL;
 }
 
+static int async_configure_app_files_paths(const char *path) {
+    char validated[PATH_MAX];
+    if (!ado_app_files_validate(path, validated)) {
+        (void)ado_app_files_configure(&g_app_files_state, path);
+        return 0;
+    }
+
+    pthread_mutex_lock(&g_app_paths_config_lock);
+    char current[PATH_MAX];
+    if (ado_app_files_get(&g_app_files_state, current, sizeof(current))) {
+        int same = strcmp(current, validated) == 0;
+        pthread_mutex_unlock(&g_app_paths_config_lock);
+        return same;
+    }
+
+    memcpy(g_app_files_dir, validated, strlen(validated) + 1);
+    int ok =
+        ado_app_files_join(g_cfg_path, sizeof(g_cfg_path), validated,
+                           "adofai_async_input.cfg") &&
+        ado_app_files_join(g_auto_replay_cfg_path,
+                           sizeof(g_auto_replay_cfg_path), validated,
+                           "adofai_async_auto_replay.cfg") &&
+        ado_app_files_join(g_trace_cfg_path, sizeof(g_trace_cfg_path), validated,
+                           "adofai_async_trace.cfg") &&
+        ado_app_files_join(g_test_macro_cfg_path,
+                           sizeof(g_test_macro_cfg_path), validated,
+                           "adofai_async_test_macro.cfg") &&
+        ado_app_files_join(g_il2cpp_handle_provider_ptr_path,
+                           sizeof(g_il2cpp_handle_provider_ptr_path), validated,
+                           "adofai_async_il2cpp_handle_provider.ptr") &&
+        ado_app_files_join(g_il2cpp_handle_provider_ptr_tmp_path,
+                           sizeof(g_il2cpp_handle_provider_ptr_tmp_path), validated,
+                           "adofai_async_il2cpp_handle_provider.ptr.tmp");
+    if (!ok) {
+        (void)ado_app_files_configure(&g_app_files_state, NULL);
+        pthread_mutex_unlock(&g_app_paths_config_lock);
+        return 0;
+    }
+
+    if (!async_publish_il2cpp_handle_provider()) {
+        (void)ado_app_files_configure(&g_app_files_state, NULL);
+        pthread_mutex_unlock(&g_app_paths_config_lock);
+        return 0;
+    }
+    ok = ado_app_files_configure(&g_app_files_state, validated);
+    pthread_mutex_unlock(&g_app_paths_config_lock);
+    if (ok) {
+        LOGI("app files directory configured");
+    }
+    return ok;
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_fizzd_connectedworlds_editorport_ExtraMenuUnityPlayerActivity_nativeConfigureAsyncInputFilesDir(
+    JNIEnv *env, jclass clazz, jstring path) {
+    (void)clazz;
+    if (env == NULL || path == NULL) {
+        return JNI_FALSE;
+    }
+    const char *chars = (*env)->GetStringUTFChars(env, path, NULL);
+    if (chars == NULL) {
+        if ((*env)->ExceptionCheck(env)) {
+            (*env)->ExceptionClear(env);
+        }
+        return JNI_FALSE;
+    }
+    int ok = async_configure_app_files_paths(chars);
+    (*env)->ReleaseStringUTFChars(env, path, chars);
+    return ok ? JNI_TRUE : JNI_FALSE;
+}
+
 JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *reserved) {
     (void)reserved;
     LOGI("JNI_OnLoad entered");
     (void)vm;
-
-    if (!async_publish_il2cpp_handle_provider()) {
-        LOGW("IL2CPP handle provider pointer unavailable");
-    }
 
     pthread_t thread;
     int rc = pthread_create(&thread, NULL, patch_thread_main, NULL);

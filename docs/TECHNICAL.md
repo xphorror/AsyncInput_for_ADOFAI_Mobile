@@ -35,6 +35,7 @@ official Simulated_PlayerControl_Update(targetTick)
 - `AsyncInputManager.get_isActive`
 - `AsyncInputUtils.UpdateOffsetTime(long)`
 - `scrController.PlayerControl_Update`
+- `scrController.Fail2Action`
 - 若干用于 trace/audit、AUTO debug path 和 Android 行为修正的辅助 hook
 
 禁止 hook：
@@ -87,6 +88,8 @@ Android 上 `CLOCK_MONOTONIC` 在系统 suspend 期间停走，而 `CLOCK_REALTI
 
 `AsyncInputManager.isActive` 不是简单等于“模块开关开启”。它只在 gameplay replay-ready 状态返回 true。
 
+主开关区分用户请求态与运行态。Hook 事务完成前，开启请求会被保留但运行态保持关闭；安装完成后再统一恢复持久化设置，避免启动竞态让输入提前进入未完整的 Hook 链。
+
 gate 关闭时：
 
 - 不向 native replay queue 注入 gameplay 输入；
@@ -97,6 +100,10 @@ gate 关闭时：
 关卡编辑器需要区分编辑态和播放/测试态：编辑态不接管；播放/测试态允许 async replay。
 
 暂停态也属于 gate 关闭条件。`scrController._paused` 为 true 时，native 会关闭 capture 并让 Java `dispatchTouchEvent/dispatchKeyEvent` 继续走 Unity 原始路径，避免暂停菜单和设置界面被 async gameplay 管线吞掉。
+
+controller gate 同时读取实时 `gameworld`、当前状态和 MonsterLove 状态机的 destination state。`gameworld=false`、当前状态离开 `PlayerControl`，或目标状态开始切向 Won/Fail/其他状态时立即关闭 capture。目标状态不可读时仅回退到当前状态判断。DLC 标志保留为诊断信息，不参与 gate。
+
+进入 `Fail2Action` 前会清空异步队列、mask 和 capture，使死亡后的下一次输入回到官方 `Fail2` 更新路径。这样编辑器测试关卡仍执行官方重试，内置关卡和分段小关也能执行各自的官方完成/切换语义。
 
 ## Mask replay
 
@@ -111,15 +118,21 @@ gate 关闭时：
 
 多指输入使用稳定 slot，不再折叠成单个 Space。近同时 DOWN 会在已经到期且已经进入队列的范围内合并，但不会为了等待第二指而阻塞第一个 DOWN。
 
+### AUTO 一次性提交
+
+自动砖仍通过官方 `Hit(isAuto)` 路径提交。兼容层为一次 replay 建立局部事务，嵌套的第一个 `Hit(isAuto)` 获得唯一提交权并调用 original，随后立即清除本次 synthetic down/held，防止同一输入在下一个小关再次触发。外层返回 original 的真实结果；若官方状态机没有产生提交，则记录警告并走原始回退路径。
+
 ## 队列和生命周期
 
-Java callback 只负责把 raw event 转交 native。native ingress thread 串行处理输入事件、reset、soft pause 和 soft resume。
+Java callback 只负责把 raw event 转交 native。native ingress thread 串行处理输入事件、reset、soft pause 和 soft resume。普通事件和控制命令使用独立容量的队列，再按全局 `seq` 合并消费；输入洪峰只会淘汰最旧普通事件，不会覆盖生命周期命令。
+
+DOWN/UP 发布后，在输入线程健康时最多等待 2 ms 确认该序列已完成 ingress 消费。超时不会删除或重发事件，记录仍由 worker 稍后处理；超时日志每秒最多输出一次。
 
 进入新 gameplay capture 时会清理旧队列并重建虚拟时钟基准；soft pause/resume 只在暂停前确实处于 gameplay capture 时复用冻结时钟。注意 `onPause` 与 `onWindowFocusChanged(false)` 通常会连发两次 soft pause，"暂停前是否在 capture"的标记因此只置位、不被第二次覆写，清零交给 soft resume 和 reset。
 
 soft resume 还会强制重同步时间换算原点，详见「时间域 / 换算原点必须持续对齐」。
 
-capture gate 有 stale timeout。如果 `PlayerControl_Update` 不再刷新 gate，native 会关闭 capture、清队列并恢复 regular input type，避免继续吞正常输入。
+capture 不再根据“主线程超过固定时间没有刷新”推断会话失效。Unity 主线程短暂停顿期间保留输入状态，capture 只在可证明的场景、状态、暂停、失焦、重置或显式关闭边界结束。
 
 Java 层必须使用 native 返回值作为消费信号：
 
@@ -166,6 +179,7 @@ trace 包括：
 
 `java/com/fizzd/connectedworlds/editorport/ExtraMenuUnityPlayerActivity.java` 演示了最小转发方式：
 
+- `onCreate` 将 `getFilesDir().getAbsolutePath()` 配置给 native；
 - `dispatchTouchEvent` 转发 `MotionEvent`
 - `dispatchKeyEvent` 转发 `KeyEvent`
 - `onPause/onResume/onWindowFocusChanged` 转发生命周期边界
@@ -175,6 +189,6 @@ trace 包括：
 ## 当前未解决问题
 
 - 消费端仍在 Unity 主线程，不能保证主线程长卡顿时实时反馈。
-- DLC async 兼容性尚未完整审计，当前使用 fuse 保护。
+- DLC 与 HOLD 的组合仍需要按目标设备和关卡做专项行为验证。
 - pause barrier、snapshot history、健康指标和系统化 Baseline/Stress 压力矩阵仍是后续工作。
 - `official_judgement.c` 尚未完整覆盖官方所有状态推进分支。

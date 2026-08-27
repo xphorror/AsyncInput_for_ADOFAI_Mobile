@@ -1,53 +1,71 @@
-# ADOFAI Android Async Input
+# ADOFAI Android 异步输入
 
-Android `arm64-v8a` input bridge for the IL2CPP build of A Dance of Fire and Ice 3.1.2.
+面向《冰与火之舞》3.1.2 Android IL2CPP 版本的 `arm64-v8a` 异步输入桥。
 
-The runtime timestamps touch and keyboard events outside Unity's frame loop, maps them to game ticks, and replays them through the game's async input masks and `ProcessKeyInputs(eventTick)` path. The official judgement state machine remains the source of truth for hit and miss decisions.
+运行时在 Unity 帧循环之外采集触摸与键盘事件，将 Android 单调时钟时间映射到游戏 tick，再通过官方异步输入 mask 和 `ProcessKeyInputs(eventTick)` 回放。命中、失误、长按与多押等结果仍由游戏原有判定状态机决定。
 
-## Current behavior
+## 当前能力
 
-- Forwards Android `dispatchTouchEvent` and `dispatchKeyEvent` events to native code.
-- Uses one native ingress thread and stable async key slots for multi-touch input.
-- Releases input to Unity while gameplay capture is inactive, including pause and menu states.
-- Resynchronizes the monotonic-to-wall-clock origin after device suspend and resume.
-- Supports `arm64-v8a` only.
-- Targets ADOFAI 3.1.2 Android IL2CPP; other game versions require separate metadata and behavior validation.
+- 转发 Android `dispatchTouchEvent` 和 `dispatchKeyEvent` 事件。
+- 使用独立 native ingress 线程和稳定按键槽支持多点触控。
+- 将输入事件与 reset、pause、resume 控制命令按全局序列处理。
+- 在暂停、菜单、编辑态、完成态、失败态和 freeroam 边界及时把输入交还 Unity。
+- 在设备挂起和恢复后重新同步单调时钟与墙上时钟原点。
+- 支持 DLC 场景，并为混合小关 AUTO 路径提供一次性提交事务。
+- 支持通过运行时 `filesDir` 配置适配不同应用包名。
+- 仅支持 `arm64-v8a`。
+- 目标版本为 ADOFAI 3.1.2 Android IL2CPP；其他游戏版本需要重新验证元数据和行为。
 
-## Native consumer ABI
+## Native 消费端 ABI
 
-`include/async_input_observer_abi.h` defines the versioned raw touch and keyboard observer ABI. Consumers register with the exported `ADOFAIAsyncInput_RegisterRawObserverV1` symbol and must validate `struct_size` and `abi_version` before reading event data.
+`include/async_input_observer_abi.h` 定义了带版本的原始触摸与键盘观察者 ABI。消费端通过导出符号 `ADOFAIAsyncInput_RegisterRawObserverV1` 注册，并在读取事件前校验 `struct_size` 和 `abi_version`。
 
-The exported `ADOFAIAsyncInputGetIl2CppHandleV1` function exposes AsyncInput's existing validated `libil2cpp.so` handle to approved in-process consumers. Its pointer is published in the app files directory for discovery. The provider can return `NULL` until AsyncInput has initialized IL2CPP, so consumers must retry instead of assuming immediate availability.
+`ADOFAIAsyncInputGetIl2CppHandleV1` 导出 AsyncInput 已验证的 `libil2cpp.so` 句柄。提供者地址会发布到应用 `filesDir`，初始化完成前可能返回 `NULL`，消费端必须允许重试。
 
-## Dependencies
+## 依赖
 
 - Windows PowerShell
-- Android NDK r25 or a compatible version
-- An `arm64-v8a` Dobby static library named `libdobby.a`
+- Android NDK r25 或兼容版本
+- `arm64-v8a` Dobby 静态库 `libdobby.a`
+- 可选：用于运行纯 C 回归测试的 GCC
 
-The repository includes the Dobby public header under `include/`, but not the static library.
+仓库包含 Dobby 公共头文件，但不包含静态库。
 
-## Build
+## 构建
 
 ```powershell
 .\build.ps1 `
   -NdkRoot "C:\Android\Sdk\ndk\25.2.9519653" `
   -DobbyRoot "C:\deps\Dobby" `
-  -PackageName "com.fizzd.connectedworlds.leveleditor.debug"
+  -AndroidApi 25
 ```
 
-Output:
+输出：
 
 ```text
 out/arm64-v8a/libAsyncInput.so
 ```
 
-The build verifies that both native consumer ABI symbols are present in `.dynsym`.
+构建脚本会检查 raw observer、IL2CPP handle provider 和 `filesDir` JNI bridge 是否存在于 `.dynsym`。
 
-To compile the optional Java forwarding example, also pass `-CompileJavaExample`, `-AndroidJar`, and `-UnityClassesJar`. The example source is under `java/`.
+若要同时编译 Java 转发示例，增加 `-CompileJavaExample`、`-AndroidJar` 和 `-UnityClassesJar`。示例位于 `java/`。
 
-See [docs/TECHNICAL.md](docs/TECHNICAL.md) for implementation details.
+## 接入要求
 
-## License
+Activity 加载 `libAsyncInput.so` 后，必须把 `getFilesDir().getAbsolutePath()` 传给 `nativeConfigureAsyncInputFilesDir`。配置完成前 native patch 线程会等待，不读取固定包名路径。
 
-MIT. See [LICENSE](LICENSE).
+Java 分发层必须使用 native 返回值决定是否消费事件：返回 `true` 时不再调用 Unity 原始输入路径，返回 `false` 时继续调用父类分发。
+
+## 测试
+
+```powershell
+.\tests\run_tests.ps1 -GccPath "C:\toolchain\bin\gcc.exe"
+```
+
+测试覆盖 ingress 控制命令隔离、运行状态恢复、完成态与 freeroam Gate、AUTO 单次提交事务。
+
+更多实现细节见 [docs/TECHNICAL.md](docs/TECHNICAL.md)。
+
+## 许可证
+
+MIT，详见 [LICENSE](LICENSE)。

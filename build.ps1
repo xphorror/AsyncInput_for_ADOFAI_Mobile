@@ -92,7 +92,8 @@ if (!(Test-Path -LiteralPath $readelf)) {
 $dynamicSymbols = (& $readelf --dyn-syms --wide $out) -join "`n"
 foreach ($requiredExport in @(
     "ADOFAIAsyncInput_RegisterRawObserverV1",
-    "ADOFAIAsyncInputGetIl2CppHandleV1"
+    "ADOFAIAsyncInputGetIl2CppHandleV1",
+    "Java_com_fizzd_connectedworlds_editorport_ExtraMenuUnityPlayerActivity_nativeConfigureAsyncInputFilesDir"
 )) {
     if ($dynamicSymbols -notmatch "(?m)\b$([regex]::Escape($requiredExport))$") {
         throw "required dynamic export missing: $requiredExport"

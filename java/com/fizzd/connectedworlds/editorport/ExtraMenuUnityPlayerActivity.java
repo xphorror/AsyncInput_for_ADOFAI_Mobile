@@ -4,6 +4,7 @@ import android.util.Log;
 import android.view.KeyEvent;
 import android.view.MotionEvent;
 import android.view.View;
+import java.io.File;
 
 public class ExtraMenuUnityPlayerActivity extends com.unity3d.player.UnityPlayerActivity {
     private static final String TAG = "ADOFAI_ASYNC_INPUT";
@@ -22,9 +23,34 @@ public class ExtraMenuUnityPlayerActivity extends com.unity3d.player.UnityPlayer
 
     private static native boolean nativeOnTouchEvent(MotionEvent event, int viewWidth, int viewHeight);
     private static native boolean nativeOnKeyEvent(KeyEvent event);
+    private static native boolean nativeConfigureAsyncInputFilesDir(String path);
     private static native void nativeOnLifecycleReset();
     private static native void nativeOnLifecyclePause();
     private static native void nativeOnLifecycleResume();
+
+    private static void configureAsyncInputFilesDir(ExtraMenuUnityPlayerActivity activity) {
+        File filesDir = activity != null ? activity.getFilesDir() : null;
+        String path = filesDir != null ? filesDir.getAbsolutePath() : null;
+        if (path == null) {
+            Log.e(TAG, "app files directory unavailable");
+            return;
+        }
+        try {
+            if (!nativeConfigureAsyncInputFilesDir(path)) {
+                Log.e(TAG, "AsyncInput app files directory rejected");
+            }
+        } catch (Throwable t) {
+            Log.e(TAG, "AsyncInput app files directory configuration failed", t);
+        }
+    }
+
+    @Override
+    protected void onCreate(android.os.Bundle savedInstanceState) {
+        if (asyncInputLoaded) {
+            configureAsyncInputFilesDir(this);
+        }
+        super.onCreate(savedInstanceState);
+    }
 
     @Override
     public boolean dispatchTouchEvent(MotionEvent event) {
